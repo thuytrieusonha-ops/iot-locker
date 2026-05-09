@@ -1,0 +1,131 @@
+name: smartlocker
+
+x-smartlocker-db-env: &smartlocker-db-env
+  SMARTLOCKER_DATABASE_HOST: mysql
+  SMARTLOCKER_DATABASE_PORT: 3306
+  SMARTLOCKER_DATABASE_NAME: ${MYSQL_DATABASE:-smartlocker}
+  SMARTLOCKER_DATABASE_USER: ${MYSQL_USER:-smartlocker_user}
+  SMARTLOCKER_DATABASE_PASSWORD: ${MYSQL_PASSWORD:-Locker123!}
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: smartlocker-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-smartlocker}
+      MYSQL_USER: ${MYSQL_USER:-smartlocker_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-Locker123!}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql_schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: server
+    container_name: smartlocker-app
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    environment:
+      <<: *smartlocker-db-env
+      SMARTLOCKER_APP_HOST: 0.0.0.0
+      SMARTLOCKER_APP_PORT: 8000
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: server
+    container_name: smartlocker-monitor
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    environment:
+      <<: *smartlocker-db-env
+      SMARTLOCKER_MONITOR_HOST: 0.0.0.0
+      SMARTLOCKER_MONITOR_PORT: 8001
+    command: ["uvicorn", "monitor:app", "--host", "0.0.0.0", "--port", "8001"]
+    ports:
+      - "8001:8001"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  kiosk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: kiosk
+    container_name: smartlocker-kiosk
+    restart: unless-stopped
+    profiles:
+      - kiosk
+    env_file:
+      - .env.docker
+    environment:
+      <<: *smartlocker-db-env
+      SMARTLOCKER_APP_HOST: 0.0.0.0
+      SMARTLOCKER_APP_PORT: 8000
+      DISPLAY: ${DISPLAY:-:0}
+      QT_QPA_PLATFORM: xcb
+      QTWEBENGINE_DISABLE_SANDBOX: "1"
+      XDG_RUNTIME_DIR: /tmp/runtime-root
+    command: ["python", "kiosk.py"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    volumes:
+      - ./.kiosk_state.json:/app/.kiosk_state.json
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    devices:
+      - /dev/dri:/dev/dri
+    ipc: host
+    shm_size: 512m
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: smartlocker-cloudflared
+    restart: unless-stopped
+    profiles:
+      - tunnel
+    command: ["tunnel", "--config", "/etc/cloudflared/config.docker.yml", "run"]
+    depends_on:
+      app:
+        condition: service_healthy
+      monitor:
+        condition: service_healthy
+    volumes:
+      - ./cloudflared:/etc/cloudflared:ro
+
+volumes:
+  mysql-data:

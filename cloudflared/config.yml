@@ -1,0 +1,9 @@
+tunnel: smartlocker
+credentials-file: /root/.cloudflared/<tunnel-id>.json
+
+ingress:
+  - hostname: monitor-smartlocker.example.com
+    service: http://127.0.0.1:8001
+  - hostname: app-smartlocker.example.com
+    service: http://127.0.0.1:8000
+  - service: http_status:404

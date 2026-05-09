@@ -1,0 +1,20 @@
+[project]
+name = "smartlocker"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.136.0",
+    "pyqt6>=6.8.1",
+    "pyqt6-webengine>=6.8.0",
+    "pywebview>=5.4",
+    "qtpy>=2.4.3",
+    "python-multipart>=0.0.20",
+    "pymysql>=1.1.2",
+    "pillow>=11.2.1",
+    "qrcode>=8.2",
+    "sqlalchemy>=2.0.49",
+    "uvicorn>=0.44.0",
+    "cryptography>=47.0.0",
+]

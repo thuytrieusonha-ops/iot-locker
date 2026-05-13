@@ -1439,10 +1439,11 @@ def page_template(
     content: str,
     show_keyboard: bool = False,
     enable_pickup_handoff_polling: bool = True,
+    enable_admin_command_polling: bool = False,
 ) -> str:
     keyboard = virtual_keyboard() if show_keyboard else ""
     page_class = "page with-keyboard" if show_keyboard else "page"
-    admin_modal_html = admin_command_modal()
+    admin_modal_html = admin_command_modal() if enable_admin_command_polling else ""
     pickup_handoff_script = """
             const refreshPickupHandoff = async () => {
                 try {
@@ -1640,6 +1641,7 @@ def page_template(
             window.setInterval(updateLiveTime, 1000);
             updateKeyboardSpace();
 
+""" + ("""
             const refreshAdminCommand = async () => {
                 try {
                     const response = await fetch("/api/admin-command", { cache: "no-store" });
@@ -1661,10 +1663,12 @@ def page_template(
                     // Keep the last visible state if polling fails.
                 }
             };
+""" if enable_admin_command_polling else "") + """
 """ + pickup_handoff_script + """
-
+""" + ("""
             refreshAdminCommand();
             window.setInterval(refreshAdminCommand, 3000);
+""" if enable_admin_command_polling else "") + """
 """ + pickup_handoff_start + """
         })();
     </script>
@@ -3343,6 +3347,7 @@ def home_page() -> str:
         </section>
         </section>
         """,
+        enable_admin_command_polling=True,
     )
 
 
@@ -3396,6 +3401,7 @@ def flow_page(
         </section>
         """,
         show_keyboard=True,
+        enable_admin_command_polling=True,
     )
 
 
@@ -3614,6 +3620,7 @@ def kiosk_user_portal_page(
         </section>
         """,
         show_keyboard=True,
+        enable_admin_command_polling=True,
     )
 
 
@@ -3651,6 +3658,7 @@ def support_page() -> str:
             </div>
         </section>
         """,
+        enable_admin_command_polling=True,
     )
 
 
@@ -3718,6 +3726,7 @@ def issue_report_page(result_html: str = "", selected_issue_type: str = "", cont
         </section>
         """,
         show_keyboard=True,
+        enable_admin_command_polling=True,
     )
 
 
@@ -3803,6 +3812,7 @@ def pickup_link_page(
         {timeout_script}
         """,
         show_keyboard=True,
+        enable_admin_command_polling=timeout_seconds > 0,
     )
 
 
@@ -3913,6 +3923,7 @@ async def user_dropoff_form() -> HTMLResponse:
                 </div>
             </section>
             """,
+            enable_admin_command_polling=True,
         )
     )
 
@@ -3942,6 +3953,7 @@ async def user_dropoff(request: Request, phone: str = Form(...)) -> HTMLResponse
                 </div>
             </section>
             """,
+            enable_admin_command_polling=True,
         )
     )
 
@@ -4164,6 +4176,7 @@ async def pickup_kiosk_handoff(raw_token: str) -> HTMLResponse:
             </section>
             """,
             enable_pickup_handoff_polling=False,
+            enable_admin_command_polling=False,
         )
     except HTTPException as exc:
         page = page_template(
@@ -4180,6 +4193,7 @@ async def pickup_kiosk_handoff(raw_token: str) -> HTMLResponse:
                 {result_panel("Không thể mở link", [exc.detail], tone="error")}
             </section>
             """,
+            enable_admin_command_polling=False,
         )
     return HTMLResponse(page)
 

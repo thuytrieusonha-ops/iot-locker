@@ -642,7 +642,7 @@ def admin_pending_html(command: AdminCommand | None) -> str:
     note_text = escape(note) if note else "Không có ghi chú."
     return f"""
     <div class="admin-pending">
-        <strong>Đang có lệnh chờ xử lý: {escape(command_label)}.</strong>
+        <strong>Đã gửi yêu cầu tới kiosk: {escape(command_label)}.</strong>
         <span>Khởi tạo lúc {escape(now_text(command.created_at))}.</span>
         <span>{escape(action_line)}</span>
         <span>{note_text}</span>
@@ -2003,7 +2003,7 @@ async def admin_unlock_all(request: Request) -> JSONResponse:
 
     _, note, _ = await read_admin_request(request)
     create_admin_command("unlock_all_lockers", note=note, status="pending")
-    return JSONResponse({"ok": True, "message": "Đã tạo lệnh mở tất cả tủ."})
+    return JSONResponse({"ok": True, "message": "Đã gửi yêu cầu mở tất cả tủ tới kiosk."})
 
 
 @app.post("/api/admin/unlock-all/complete", response_class=JSONResponse)
@@ -2041,7 +2041,7 @@ async def admin_unlock_one(request: Request) -> JSONResponse:
 
     create_admin_command("unlock_single_locker", note=build_unlock_command_note(valid_locker_ids, note), status="pending")
     lockers_text = ", ".join(f"Tủ {locker_id}" for locker_id in valid_locker_ids)
-    return JSONResponse({"ok": True, "message": f"Đã tạo lệnh mở {lockers_text}."})
+    return JSONResponse({"ok": True, "message": f"Đã gửi yêu cầu mở {lockers_text} tới kiosk."})
 
 
 @app.post("/api/admin/purge-collected", response_class=JSONResponse)

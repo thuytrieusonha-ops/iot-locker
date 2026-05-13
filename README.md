@@ -264,6 +264,9 @@ Sau do sua cac bien can thiet, dac biet:
 
 - `MYSQL_ROOT_PASSWORD`
 - `MYSQL_PASSWORD`
+- `MYSQL_HOST_PORT` neu may da co MySQL khac dang chiem cong `3306`
+- `SMARTLOCKER_APP_HOST_PORT` neu may da co dich vu khac dang chiem cong `8000`
+- `SMARTLOCKER_MONITOR_HOST_PORT` neu may da co dich vu khac dang chiem cong `8001`
 - `SMARTLOCKER_ADMIN_USERNAME`
 - `SMARTLOCKER_ADMIN_PASSWORD`
 - cac bien SMTP neu muon gui email that
@@ -288,6 +291,17 @@ Sau khi chay xong:
 
 - `http://localhost:8000` -> app
 - `http://localhost:8001` -> monitor
+- `127.0.0.1:3307` -> MySQL tren host neu ban can ket noi truc tiep
+
+Neu host dang ban cac cong nay, doi trong `.env.docker`, vi du:
+
+```bash
+MYSQL_HOST_PORT='13306'
+SMARTLOCKER_APP_HOST_PORT='18000'
+SMARTLOCKER_MONITOR_HOST_PORT='18001'
+SMARTLOCKER_BASE_URL='http://localhost:18000'
+SMARTLOCKER_MONITOR_URL='http://localhost:18001'
+```
 
 Xem log:
 

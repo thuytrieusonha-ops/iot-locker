@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS locker_orders (
     recipient_email VARCHAR(255) NULL,
     email_delivery_status VARCHAR(20) NULL,
     email_delivery_note VARCHAR(255) NULL,
+    email_link_base_url VARCHAR(255) NULL,
     email_sent_at DATETIME NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'stored',
     PRIMARY KEY (id),

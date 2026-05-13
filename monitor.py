@@ -39,8 +39,8 @@ ACTIVE_ADMIN_LOCK_MESSAGE = "Đã có một quản trị viên khác đang đăn
 USER_PORTAL_PATH = "/portal"
 
 FLOW_LABELS = {
-    "user_dropoff": "Gửi đồ phổ thông",
-    "shipper_dropoff": "Giao đồ cho khách",
+    "user_dropoff": "Giao hàng",
+    "shipper_dropoff": "Giao hàng",
 }
 
 STATUS_LABELS = {
@@ -779,9 +779,12 @@ def page_shell(title: str, subtitle: str, content: str, script: str = "") -> str
                 border: 1px solid var(--line);
                 border-radius: 22px;
                 box-shadow: var(--shadow);
-                backdrop-filter: blur(10px);
             }}
             .panel, .notice, .role-card {{ padding: 18px; margin-bottom: 16px; }}
+            .panel, .notice {{
+                content-visibility: auto;
+                contain-intrinsic-size: 480px;
+            }}
             .role-card h2, .section-head h2 {{ margin: 0 0 8px; }}
             .role-card p, .section-head p, .notice p, .muted, .timestamp {{ color: var(--muted); }}
             .role-card {{
@@ -848,6 +851,13 @@ def page_shell(title: str, subtitle: str, content: str, script: str = "") -> str
                 margin-bottom: 14px;
             }}
             .form-grid.single {{ grid-template-columns: 1fr; }}
+            .form-actions {{
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 10px;
+                grid-column: 1 / -1;
+            }}
+            .form-actions .button {{ width: 100%; }}
             label span {{
                 display: block;
                 margin-bottom: 6px;
@@ -913,14 +923,15 @@ def page_shell(title: str, subtitle: str, content: str, script: str = "") -> str
             }}
             .locker-grid {{
                 display: grid;
-                grid-template-columns: repeat(4, minmax(0, 1fr));
+                grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
                 gap: 12px;
             }}
             .locker-card {{
                 border-radius: 18px;
-                padding: 14px;
+                padding: 16px;
                 border: 1px solid var(--line);
                 background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+                min-width: 0;
             }}
             .locker-card.free {{
                 background: linear-gradient(180deg, #f4fff8 0%, #dcfce7 100%);
@@ -933,22 +944,27 @@ def page_shell(title: str, subtitle: str, content: str, script: str = "") -> str
                 justify-content: space-between;
                 gap: 10px;
                 margin-bottom: 10px;
-                align-items: center;
+                align-items: flex-start;
+                flex-wrap: wrap;
             }}
             .locker-head strong {{ font-size: 1rem; }}
             .locker-head span {{
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
                 background: rgba(255, 255, 255, 0.85);
                 border-radius: 999px;
                 padding: 6px 10px;
                 font-size: 0.82rem;
                 color: var(--accent);
+                white-space: nowrap;
             }}
             .locker-line {{
                 color: #31506d;
-                margin-top: 6px;
+                margin-top: 8px;
                 display: grid;
-                grid-template-columns: 56px minmax(0, 1fr);
-                gap: 6px;
+                grid-template-columns: 70px minmax(0, 1fr);
+                gap: 8px;
                 align-items: start;
                 font-size: 0.92rem;
             }}
@@ -961,6 +977,7 @@ def page_shell(title: str, subtitle: str, content: str, script: str = "") -> str
                 line-height: 1.45;
                 overflow-wrap: anywhere;
                 word-break: break-word;
+                text-align: left;
             }}
             .summary-card .summary-email {{
                 display: block;
@@ -975,6 +992,8 @@ def page_shell(title: str, subtitle: str, content: str, script: str = "") -> str
                 border: 1px solid var(--line);
                 border-radius: 16px;
                 background: rgba(255, 255, 255, 0.92);
+                contain: layout paint;
+                -webkit-overflow-scrolling: touch;
             }}
             table {{ width: 100%; border-collapse: collapse; min-width: 1080px; }}
             th, td {{ padding: 12px 10px; text-align: left; border-bottom: 1px solid var(--line); }}
@@ -1042,6 +1061,8 @@ def page_shell(title: str, subtitle: str, content: str, script: str = "") -> str
                 padding: 16px;
                 background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
                 border: 1px solid rgba(18, 93, 160, 0.12);
+                content-visibility: auto;
+                contain-intrinsic-size: 240px;
             }}
             .admin-card h3 {{ margin: 0 0 6px; color: #0d4f8f; }}
             .admin-card p {{ margin: 0 0 16px; color: var(--muted); line-height: 1.45; }}
@@ -1095,7 +1116,7 @@ def page_shell(title: str, subtitle: str, content: str, script: str = "") -> str
             .admin-pending span {{ display: block; }}
             .admin-pending span {{ margin-top: 6px; }}
             @media (max-width: 980px) {{
-                .grid-roles, .summary-grid, .locker-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+                .grid-roles, .summary-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
                 .form-grid, .admin-grid, .admin-actions {{ grid-template-columns: 1fr; }}
                 .locker-select-grid {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
                 .hero, .section-head {{ flex-direction: column; align-items: start; }}
@@ -1105,6 +1126,8 @@ def page_shell(title: str, subtitle: str, content: str, script: str = "") -> str
             @media (max-width: 640px) {{
                 .page {{ padding: 20px 14px 28px; }}
                 .grid-roles, .summary-grid, .locker-grid, .locker-select-grid {{ grid-template-columns: 1fr; }}
+                .form-actions {{ grid-template-columns: 1fr; }}
+                .locker-line {{ grid-template-columns: 62px minmax(0, 1fr); }}
                 .role-card {{
                     min-height: 220px;
                 }}
@@ -1150,7 +1173,7 @@ def home_page() -> str:
                     </span>
                     <h2>Người dùng</h2>
                     <p>Lưu email và tra cứu đơn hàng theo số điện thoại.</p>
-                    <a class="nav-link primary role-action" href="/portal">Mở cổng người dùng</a>
+                    <a class="nav-link primary role-action" href="/portal">Đăng ký mail nhận mã</a>
                 </div>
             </article>
             <article class="role-card compact">
@@ -1166,7 +1189,7 @@ def home_page() -> str:
                     </span>
                     <h2>Quản trị</h2>
                     <p>Theo dõi tình trạng tủ và gửi lệnh điều khiển từ xa.</p>
-                    <a class="nav-link secondary role-action" href="/admin">Mở dashboard quản trị</a>
+                    <a class="nav-link secondary role-action" href="/admin">Vào trang quản trị</a>
                 </div>
             </article>
         </section>
@@ -1195,7 +1218,7 @@ def home_page() -> str:
         })();
     </script>
     """
-    return page_shell("Smart Locker Access", "Chọn đúng vai trò để tiếp tục.", content, script)
+    return page_shell("Smart Locker", "Chọn đúng vai trò để tiếp tục.", content, script)
 
 
 def result_box(title: str, message: str, tone: str = "success") -> str:
@@ -1207,7 +1230,7 @@ def result_box(title: str, message: str, tone: str = "success") -> str:
     """
 
 
-def sync_user_email(phone: str, email: str) -> tuple[str, list[LockerOrder]]:
+def sync_user_email(phone: str, email: str, force_resend: bool = False) -> tuple[str, list[LockerOrder]]:
     ensure_database()
     assert SessionLocal is not None
 
@@ -1228,32 +1251,49 @@ def sync_user_email(phone: str, email: str) -> tuple[str, list[LockerOrder]]:
             action = "cập nhật"
 
         email_changed = previous_email is None or previous_email != email
+        if account is not None and not email_changed:
+            action = "tra cứu"
         orders = session.scalars(select(LockerOrder).where(LockerOrder.phone == phone).order_by(desc(LockerOrder.created_at))).all()
         queued_count = 0
-        for item in orders:
-            if item.status != "stored":
-                continue
+        if email_changed or force_resend:
+            for item in orders:
+                if item.status != "stored":
+                    continue
 
-            queued_count += 1
-            item.recipient_email = email
-            item.email_delivery_status = "pending"
-            item.email_delivery_note = (
-                "Đã cập nhật email mới từ cổng người dùng, chuẩn bị gửi lại mail cho đơn đang còn trong tủ."
-                if email_changed
-                else "Đã xác nhận lại email từ cổng người dùng, chuẩn bị gửi mail cho tất cả đơn đang còn trong tủ."
-            )
-            item.email_sent_at = None
+                queued_count += 1
+                item.recipient_email = email
+                item.email_delivery_status = "pending"
+                item.email_delivery_note = (
+                    "Người dùng yêu cầu gửi lại mail mở tủ từ cổng người dùng."
+                    if force_resend and not email_changed
+                    else "Đã cập nhật email mới từ cổng người dùng, chuẩn bị gửi lại mail cho đơn đang còn trong tủ."
+                )
+                item.email_sent_at = None
 
         session.commit()
 
-    attempted, delivered = retry_email_delivery_for_phone(phone, email)
+    attempted = 0
+    delivered = 0
+    if email_changed or force_resend:
+        attempted, delivered = retry_email_delivery_for_phone(phone, email)
 
     with SessionLocal() as session:
         refreshed_orders = session.scalars(
             select(LockerOrder).where(LockerOrder.phone == phone).order_by(desc(LockerOrder.created_at))
         ).all()
 
-    if queued_count == 0:
+    if force_resend:
+        if queued_count == 0:
+            action = f"{action}; không có đơn đang lưu cần gửi lại email"
+        elif delivered == attempted and attempted == queued_count:
+            action = f"{action}; đã gửi lại email cho {delivered} đơn đang lưu"
+        elif delivered > 0:
+            action = f"{action}; đã gửi lại email cho {delivered}/{queued_count} đơn đang lưu"
+        else:
+            action = f"{action}; chưa gửi lại được email, kiểm tra lại SMTP Gmail"
+    elif not email_changed:
+        action = f"{action}; email trùng với email đã đăng ký gần nhất nên không gửi lại mail"
+    elif queued_count == 0:
         action = f"{action}; không có đơn đang lưu cần gửi lại email"
     elif delivered == attempted and attempted == queued_count:
         action = f"{action}; đã gửi lại email cho {delivered} đơn đang lưu"
@@ -1275,18 +1315,11 @@ def user_lookup_page(
     orders = orders or []
     order_count = len(orders)
     active_count = sum(1 for item in orders if item.status == "stored")
-    kiosk_url = kiosk_home_url(request)
-    kiosk_home_link = (
-        f'<a class="nav-link secondary" href="{escape(kiosk_url)}">Về trang chủ kiosk</a>'
-        if kiosk_url
-        else ""
-    )
     content = f"""
     <section class="notice">
         <h2>Tra cứu và đăng ký nhận thông báo</h2>
         <div class="nav-row">
-            {kiosk_home_link}
-            <a class="nav-link secondary" href="/">Làm mới cổng người dùng</a>
+            <a class="nav-link secondary" href="/">Trang chủ</a>
         </div>
     </section>
     <section class="panel">
@@ -1300,8 +1333,9 @@ def user_lookup_page(
                 <span>Email</span>
                 <input name="email" type="email" placeholder="Nhập email nhận thông báo" autocomplete="email" required value="{escape(email)}">
             </label>
-            <div>
-                <button class="button primary" type="submit">Lưu và tra cứu</button>
+            <div class="form-actions">
+                <button class="button secondary" type="submit" name="intent" value="lookup">Tra cứu</button>
+                <button class="button primary" type="submit" name="intent" value="resend">Lưu mail và gửi lại mail mới</button>
             </div>
         </form>
     </section>
@@ -1363,7 +1397,7 @@ def admin_login_page(result_html: str = "") -> str:
     <section class="notice">
         <h2>Đăng nhập quản trị</h2>
         <div class="nav-row">
-            <a class="nav-link secondary" href="{user_portal_url()}">Sang cổng người dùng</a>
+            <a class="nav-link secondary" href="/">Trang chủ</a>
         </div>
     </section>
     <section class="panel">
@@ -1494,6 +1528,9 @@ def admin_dashboard_page(csrf_token: str = "") -> str:
         content = f"""
         <section class="notice" id="monitor-notice">
             <h2>Chưa cấu hình database</h2>
+            <div class="nav-row">
+                <a class="nav-link secondary" href="/">Trang chủ</a>
+            </div>
             <p>Hãy đặt biến SMARTLOCKER_DATABASE_URL trước khi chạy monitor.</p>
             <p>URL monitor hiện tại: <code>{access_url}</code></p>
         </section>
@@ -1503,7 +1540,7 @@ def admin_dashboard_page(csrf_token: str = "") -> str:
         <section class="notice" id="monitor-notice">
             <h2>Khu vực quản trị đang hoạt động</h2>
             <div class="nav-row">
-                <a class="nav-link secondary" href="{user_portal_url()}">Sang cổng người dùng</a>
+                <a class="nav-link secondary" href="/">Trang chủ</a>
                 <form method="post" action="/admin/logout">
                     <input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
                     <button type="submit" class="button secondary">Đăng xuất</button>
@@ -1622,6 +1659,8 @@ def admin_dashboard_page(csrf_token: str = "") -> str:
             const lockerSelectGrid = document.getElementById("locker-select-grid");
             const adminNote = document.getElementById("admin-note");
             const adminConfirmation = document.getElementById("admin-confirmation");
+            let isRefreshing = false;
+            let lastPayloadHash = "";
 
             const setAdminFeedback = (message, tone = "") => {{
                 if (!adminFeedback) return;
@@ -1667,7 +1706,7 @@ def admin_dashboard_page(csrf_token: str = "") -> str:
                     notice.innerHTML = `
                         <h2>Khu vực quản trị đang hoạt động</h2>
                         <div class="nav-row">
-                            <a class="nav-link secondary" href="{user_portal_url()}">Sang cổng người dùng</a>
+                            <a class="nav-link secondary" href="/">Trang chủ</a>
                             <form method="post" action="/admin/logout">
                                 <input type="hidden" name="csrf_token" value="${{csrfToken}}">
                                 <button type="submit" class="button secondary">Đăng xuất</button>
@@ -1677,6 +1716,9 @@ def admin_dashboard_page(csrf_token: str = "") -> str:
                 }} else {{
                     notice.innerHTML = `
                         <h2>Chưa cấu hình database</h2>
+                        <div class="nav-row">
+                            <a class="nav-link secondary" href="/">Trang chủ</a>
+                        </div>
                         <p>Hãy đặt biến SMARTLOCKER_DATABASE_URL trước khi chạy monitor.</p>
                         <p>URL monitor hiện tại: <code>${{payload.access_url}}</code></p>
                     `;
@@ -1690,13 +1732,25 @@ def admin_dashboard_page(csrf_token: str = "") -> str:
                 if (totalEl) totalEl.textContent = payload.summary.total;
                 if (collectedEl) collectedEl.textContent = payload.summary.collected;
                 if (updatedEl) updatedEl.textContent = `Lần cập nhật gần nhất: ${{payload.last_updated}}`;
-                if (lockerGrid) lockerGrid.innerHTML = payload.locker_grid_html;
-                if (historyRows) historyRows.innerHTML = payload.history_rows_html;
-                if (issueReportRows) issueReportRows.innerHTML = payload.issue_report_rows_html;
-                if (adminPendingHost) adminPendingHost.innerHTML = payload.admin_pending_html || "";
+                if (lockerGrid && lockerGrid.innerHTML !== payload.locker_grid_html) {{
+                    lockerGrid.innerHTML = payload.locker_grid_html;
+                }}
+                if (historyRows && historyRows.innerHTML !== payload.history_rows_html) {{
+                    historyRows.innerHTML = payload.history_rows_html;
+                }}
+                if (issueReportRows && issueReportRows.innerHTML !== payload.issue_report_rows_html) {{
+                    issueReportRows.innerHTML = payload.issue_report_rows_html;
+                }}
+                if (adminPendingHost && adminPendingHost.innerHTML !== (payload.admin_pending_html || "")) {{
+                    adminPendingHost.innerHTML = payload.admin_pending_html || "";
+                }}
             }};
 
             const refreshMonitor = async () => {{
+                if (isRefreshing || document.hidden) {{
+                    return;
+                }}
+                isRefreshing = true;
                 try {{
                     const response = await fetch("/api/admin/monitor", {{ cache: "no-store" }});
                     if (response.status === 403) {{
@@ -1707,9 +1761,22 @@ def admin_dashboard_page(csrf_token: str = "") -> str:
                         throw new Error(`HTTP ${{response.status}}`);
                     }}
                     const payload = await response.json();
-                    applyPayload(payload);
+                    const nextHash = JSON.stringify([
+                        payload.summary,
+                        payload.last_updated,
+                        payload.locker_grid_html,
+                        payload.history_rows_html,
+                        payload.issue_report_rows_html,
+                        payload.admin_pending_html || "",
+                    ]);
+                    if (nextHash !== lastPayloadHash) {{
+                        applyPayload(payload);
+                        lastPayloadHash = nextHash;
+                    }}
                 }} catch (error) {{
                     setAdminFeedback("Không thể lấy dữ liệu mới. Hệ thống sẽ tự thử lại.", "error");
+                }} finally {{
+                    isRefreshing = false;
                 }}
             }};
 
@@ -1773,7 +1840,7 @@ def admin_dashboard_page(csrf_token: str = "") -> str:
 
             renderLockerSelection(getSelectedLockerIds());
             refreshMonitor();
-            window.setInterval(refreshMonitor, 3000);
+            window.setInterval(refreshMonitor, 10000);
         }})();
     </script>
     """
@@ -1803,8 +1870,8 @@ def unauthorized_response(detail: str = "Bạn cần đăng nhập quản trị 
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index() -> RedirectResponse:
-    return RedirectResponse(url=USER_PORTAL_PATH, status_code=307)
+async def index() -> HTMLResponse:
+    return HTMLResponse(home_page())
 
 
 @app.get("/portal", response_class=HTMLResponse)
@@ -1813,14 +1880,24 @@ async def user_lookup_form(request: Request) -> HTMLResponse:
 
 
 @app.post("/portal", response_class=HTMLResponse)
-async def user_lookup(request: Request, phone: str = Form(...), email: str = Form(...)) -> HTMLResponse:
+async def user_lookup(
+    request: Request,
+    phone: str = Form(...),
+    email: str = Form(...),
+    intent: str = Form("lookup"),
+) -> HTMLResponse:
     try:
         normalized_phone = normalize_phone(phone)
         normalized_email = normalize_email(email)
-        action, orders = sync_user_email(normalized_phone, normalized_email)
+        resend_requested = intent == "resend"
+        action, orders = sync_user_email(normalized_phone, normalized_email, force_resend=resend_requested)
         result_html = result_box(
-            "Lưu và tra cứu thành công",
-            f"Hệ thống đã {action} email và đồng bộ dữ liệu đơn hàng cho số điện thoại này.",
+            "Đã gửi lại mail" if resend_requested else "Lưu và tra cứu thành công",
+            (
+                f"Hệ thống đã {action} và tra cứu dữ liệu đơn hàng cho số điện thoại này."
+                if resend_requested
+                else f"Hệ thống đã {action} email và tra cứu dữ liệu đơn hàng cho số điện thoại này."
+            ),
         )
         return HTMLResponse(user_lookup_page(request, result_html, normalized_phone, normalized_email, orders))
     except HTTPException as exc:
@@ -1840,14 +1917,14 @@ async def user_lookup_legacy_post(request: Request, phone: str = Form(...), emai
 
 @app.post("/switch-role/home")
 async def switch_role_home(request: Request) -> RedirectResponse:
-    response = RedirectResponse(url=USER_PORTAL_PATH, status_code=303)
+    response = RedirectResponse(url="/", status_code=303)
     clear_admin_session(response, request)
     return response
 
 
 @app.post("/switch-role/user")
 async def switch_role_user(request: Request) -> RedirectResponse:
-    response = RedirectResponse(url=USER_PORTAL_PATH, status_code=303)
+    response = RedirectResponse(url="/", status_code=303)
     clear_admin_session(response, request)
     return response
 

@@ -45,6 +45,7 @@ class LockerRecord:
     recipient_email: str | None = None
     email_delivery_status: str | None = None
     email_delivery_note: str | None = None
+    email_link_base_url: str | None = None
     email_sent_at: datetime | None = None
     status: str = "stored"
 
@@ -79,8 +80,8 @@ pickup_handoff_request: dict[str, object] = {"id": 0, "token": "", "requested_at
 
 
 FLOW_LABELS = {
-    "user_dropoff": "Gửi đồ phổ thông",
-    "shipper_dropoff": "Giao đồ cho khách",
+    "user_dropoff": "Giao hàng",
+    "shipper_dropoff": "Giao hàng",
 }
 
 ADMIN_ACTION_LABELS = {
@@ -162,6 +163,38 @@ def database_unavailable_page() -> str:
 @app.exception_handler(SQLAlchemyError)
 async def database_error_handler(request: Request, exc: Exception) -> HTMLResponse:
     return HTMLResponse(database_unavailable_page(), status_code=503)
+
+
+def read_dotenv_value(name: str, filename: str = ".env") -> str:
+    dotenv_path = Path(__file__).resolve().parent / filename
+    if not dotenv_path.exists():
+        return ""
+
+    for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        if key.strip() != name:
+            continue
+
+        cleaned = value.strip()
+        if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {"'", '"'}:
+            cleaned = cleaned[1:-1]
+        return cleaned.strip()
+
+    return ""
+
+
+def current_configured_url(name: str, fallback: str = "") -> str:
+    dotenv_value = read_dotenv_value(name).rstrip("/")
+    if dotenv_value:
+        return dotenv_value
+    env_value = os.getenv(name, "").strip().rstrip("/")
+    if env_value:
+        return env_value
+    return fallback.rstrip("/")
 
 
 def now_text(value: datetime) -> str:
@@ -249,8 +282,9 @@ def mask_email(email: str) -> str:
 
 
 def get_base_url(request: Request | None = None) -> str:
-    if BASE_URL:
-        return BASE_URL
+    configured_base_url = current_configured_url("SMARTLOCKER_BASE_URL", BASE_URL)
+    if configured_base_url:
+        return configured_base_url
     if APP_HOST:
         return build_local_url(APP_HOST, APP_PORT).rstrip("/")
     if request is None:
@@ -267,8 +301,9 @@ def build_pickup_code_qr_url(pickup_code: str, request: Request | None = None) -
 
 
 def get_monitor_user_portal_url() -> str:
-    if MONITOR_URL:
-        return f"{MONITOR_URL}/portal"
+    monitor_url = current_configured_url("SMARTLOCKER_MONITOR_URL", MONITOR_URL)
+    if monitor_url:
+        return f"{monitor_url}/portal"
     return ""
 
 
@@ -416,6 +451,7 @@ def send_pickup_email(
 
 
 def deliver_pickup_email(record: LockerRecord, email: str, request: Request | None = None) -> tuple[LockerRecord, bool, str]:
+    active_base_url = get_base_url(request)
     _, pickup_link, expires_at = issue_pickup_access(record, email, request)
     sent, delivery_note = send_pickup_email(
         email,
@@ -432,6 +468,7 @@ def deliver_pickup_email(record: LockerRecord, email: str, request: Request | No
         "sent" if sent else "smtp_missing",
         delivery_note,
         datetime.now() if sent else None,
+        active_base_url,
     )
     return updated_record, sent, delivery_note
 
@@ -451,6 +488,7 @@ def is_retryable_email_error(exc: BaseException) -> bool:
 
 
 def queue_pickup_email_delivery(record: LockerRecord, email: str, request: Request | None = None) -> tuple[LockerRecord, str]:
+    active_base_url = get_base_url(request)
     _, pickup_link, expires_at = issue_pickup_access(record, email, request)
     queued_record = update_record_email_delivery(
         record,
@@ -458,6 +496,7 @@ def queue_pickup_email_delivery(record: LockerRecord, email: str, request: Reque
         "pending",
         "Hệ thống đang gửi email. Vui lòng kiểm tra hộp thư trong ít phút.",
         None,
+        active_base_url,
     )
 
     def worker() -> None:
@@ -471,6 +510,7 @@ def queue_pickup_email_delivery(record: LockerRecord, email: str, request: Reque
                         "pending",
                         f"Đang thử gửi lại email lần {attempt}/{SMTP_RETRY_ATTEMPTS}.",
                         None,
+                        active_base_url,
                     )
                 sent, delivery_note = send_pickup_email(
                     email,
@@ -487,6 +527,7 @@ def queue_pickup_email_delivery(record: LockerRecord, email: str, request: Reque
                     "sent" if sent else "smtp_missing",
                     delivery_note,
                     datetime.now() if sent else None,
+                    active_base_url,
                 )
                 return
             except (OSError, smtplib.SMTPException, TimeoutError) as exc:
@@ -503,6 +544,8 @@ def queue_pickup_email_delivery(record: LockerRecord, email: str, request: Reque
             email,
             "failed",
             f"Gửi email thất bại sau {SMTP_RETRY_ATTEMPTS} lần. {last_error}".strip(),
+            None,
+            active_base_url,
         )
 
     Thread(target=worker, daemon=True).start()
@@ -554,6 +597,7 @@ def to_record(item: LockerOrder) -> LockerRecord:
         recipient_email=item.recipient_email,
         email_delivery_status=item.email_delivery_status,
         email_delivery_note=item.email_delivery_note,
+        email_link_base_url=getattr(item, "email_link_base_url", None),
         email_sent_at=item.email_sent_at,
         status=item.status,
     )
@@ -738,6 +782,7 @@ def update_record_email_delivery(
     delivery_status: str,
     delivery_note: str,
     email_sent_at: datetime | None = None,
+    email_link_base_url: str | None = None,
 ) -> LockerRecord:
     with state_lock:
         if not using_database():
@@ -746,12 +791,14 @@ def update_record_email_delivery(
                     locker_record.recipient_email = recipient_email
                     locker_record.email_delivery_status = delivery_status
                     locker_record.email_delivery_note = delivery_note
+                    locker_record.email_link_base_url = email_link_base_url
                     locker_record.email_sent_at = email_sent_at
                     lockers[locker_id] = locker_record
                     return locker_record
             record.recipient_email = recipient_email
             record.email_delivery_status = delivery_status
             record.email_delivery_note = delivery_note
+            record.email_link_base_url = email_link_base_url
             record.email_sent_at = email_sent_at
             return record
 
@@ -769,6 +816,7 @@ def update_record_email_delivery(
             order.recipient_email = recipient_email
             order.email_delivery_status = delivery_status
             order.email_delivery_note = delivery_note
+            order.email_link_base_url = email_link_base_url
             order.email_sent_at = email_sent_at
             session.commit()
             session.refresh(order)
@@ -1946,8 +1994,15 @@ def page_template(
                 min-height: 0;
                 display: flex;
                 flex-direction: column;
+                align-items: center;
                 justify-content: center;
                 padding: clamp(12px, 2.8vh, 24px) 0 clamp(10px, 2.4vh, 20px);
+            }}
+
+            .compact-home {{
+                width: 100%;
+                max-width: 1180px;
+                margin: 0 auto;
             }}
 
             .home-hero {{
@@ -1959,12 +2014,19 @@ def page_template(
                 font-size: clamp(2.1rem, 4vw, 3.1rem);
             }}
 
+            .home-actions {{
+                grid-template-columns: repeat(2, minmax(320px, 420px));
+                justify-content: center;
+                max-width: 900px;
+            }}
+
             .assist-grid {{
                 display: grid;
-                grid-template-columns: repeat(2, minmax(220px, 280px));
-                justify-content: space-between;
+                grid-template-columns: repeat(2, minmax(240px, 340px));
+                justify-content: center;
                 gap: 12px;
-                max-width: 920px;
+                width: 100%;
+                max-width: 900px;
                 margin: 10px auto 0;
                 align-items: stretch;
             }}
@@ -2023,18 +2085,14 @@ def page_template(
                 font-size: 0.92rem;
             }}
 
-            .assist-card:last-child {{
-                justify-self: end;
-            }}
-
             .portal-panel {{
                 margin: 10px auto 0;
-                width: min(920px, 100%);
+                width: min(1000px, 100%);
                 display: grid;
-                grid-template-columns: minmax(0, 1.6fr) 196px;
-                gap: 12px;
-                align-items: stretch;
-                padding: 16px;
+                grid-template-columns: minmax(0, 1.35fr) 220px;
+                gap: 18px;
+                align-items: center;
+                padding: 18px 20px;
             }}
 
             .portal-copy {{
@@ -2104,8 +2162,8 @@ def page_template(
             }}
 
             .compact-home .portal-panel {{
-                grid-template-columns: minmax(0, 1fr) 180px;
-                gap: 10px;
+                grid-template-columns: minmax(0, 1.15fr) 200px;
+                gap: 16px;
             }}
 
             .compact-home .portal-copy h2 {{
@@ -2117,12 +2175,12 @@ def page_template(
             }}
 
             .compact-home .portal-qr-card {{
-                width: 180px;
-                padding: 10px;
+                width: 200px;
+                padding: 12px;
             }}
 
             .compact-home .portal-qr-image {{
-                width: 116px;
+                width: 124px;
             }}
 
             .layout {{
@@ -2208,6 +2266,12 @@ def page_template(
                 margin-top: 14px;
             }}
 
+            .form-actions {{
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 12px;
+            }}
+
             label {{
                 display: block;
                 font-size: 0.96rem;
@@ -2244,6 +2308,11 @@ def page_template(
                 color: #ffffff;
                 background: linear-gradient(180deg, #1678d8, #0b4fae);
                 cursor: pointer;
+            }}
+
+            .submit-button.secondary {{
+                color: #0b4fae;
+                background: #eef6ff;
             }}
 
             .result-panel {{
@@ -2997,8 +3066,8 @@ def page_template(
                     grid-template-columns: repeat(3, minmax(0, 1fr));
                     max-width: 100%;
                     gap: 14px;
-                    margin-left: 0;
-                    margin-right: 0;
+                    margin-left: auto;
+                    margin-right: auto;
                 }}
 
                 .action-send,
@@ -3020,20 +3089,27 @@ def page_template(
             @media (max-width: 760px) {{
                 .home-actions {{
                     grid-template-columns: 1fr;
+                    max-width: 420px;
                 }}
 
                 .assist-grid {{
                     grid-template-columns: 1fr;
+                    max-width: 420px;
                 }}
 
-                .assist-card:last-child {{
-                    justify-self: stretch;
+                .compact-home .portal-panel {{
+                    grid-template-columns: 1fr;
+                    max-width: 420px;
                 }}
             }}
 
             @media (max-width: 640px) {{
                 .page {{
                     padding: 18px 16px 24px;
+                }}
+
+                .form-actions {{
+                    grid-template-columns: 1fr;
                 }}
 
                 .admin-alert-backdrop {{
@@ -3208,18 +3284,6 @@ def home_page() -> str:
         </section>
 
         <section class="button-grid home-actions">
-            <a class="main-button action-send" href="/gui-do">
-                <div class="button-icon" aria-hidden="true">
-                    <svg viewBox="0 0 24 24">
-                        <path d="M12 3.75 19 7.5v9L12 20.25 5 16.5v-9L12 3.75Z" />
-                        <path d="M5 7.5 12 11.25 19 7.5" />
-                        <path d="M12 11.25v9" />
-                        <path d="M9.25 6.1 16.2 9.85" />
-                    </svg>
-                </div>
-                <strong>Gửi đồ</strong>
-                <span>Tự gửi đồ vào tủ.</span>
-            </a>
             <a class="main-button action-deliver" href="/giao-do">
                 <div class="button-icon" aria-hidden="true">
                     <svg viewBox="0 0 24 24">
@@ -3231,8 +3295,8 @@ def home_page() -> str:
                         <circle cx="17.5" cy="18" r="1.75" />
                     </svg>
                 </div>
-                <strong>Giao đồ</strong>
-                <span>Lưu đơn cho khách nhận.</span>
+                <strong>Giao hàng</strong>
+                <span>Tạo đơn giao hàng và lưu vào tủ cho khách nhận.</span>
             </a>
             <a class="main-button action-receive" href="/nhan-do">
                 <div class="button-icon" aria-hidden="true">
@@ -3243,8 +3307,8 @@ def home_page() -> str:
                         <path d="M12 16.6v1.9" />
                     </svg>
                 </div>
-                <strong>Nhận đồ</strong>
-                <span>Nhập mã để mở tủ.</span>
+                <strong>Nhận hàng</strong>
+                <span>Nhập mã để xác nhận và mở tủ nhận hàng.</span>
             </a>
         </section>
 
@@ -3384,7 +3448,7 @@ def kiosk_user_history_table(orders: list[LockerOrder]) -> str:
     """
 
 
-def sync_kiosk_user_email(phone: str, email: str) -> tuple[str, list[LockerOrder]]:
+def sync_kiosk_user_email(phone: str, email: str, force_resend: bool = False) -> tuple[str, list[LockerOrder]]:
     if not using_database() or SessionLocal is None:
         raise HTTPException(status_code=503, detail="Kiosk chưa kết nối được cơ sở dữ liệu.")
 
@@ -3405,32 +3469,53 @@ def sync_kiosk_user_email(phone: str, email: str) -> tuple[str, list[LockerOrder
             action = "cập nhật"
 
         email_changed = previous_email is None or previous_email != email
+        if account is not None and not email_changed:
+            action = "tra cứu"
+        current_base_url = current_configured_url("SMARTLOCKER_BASE_URL", BASE_URL)
         orders = session.scalars(select(LockerOrder).where(LockerOrder.phone == phone).order_by(desc(LockerOrder.created_at))).all()
         queued_count = 0
         for item in orders:
             if item.status != "stored":
                 continue
 
+            if not email_changed and not force_resend:
+                continue
+
             queued_count += 1
             item.recipient_email = email
             item.email_delivery_status = "pending"
             item.email_delivery_note = (
-                "Đã cập nhật email mới từ kiosk, chuẩn bị gửi lại mail cho đơn đang còn trong tủ."
-                if email_changed
-                else "Đã xác nhận lại email từ kiosk, chuẩn bị gửi mail cho tất cả đơn đang còn trong tủ."
+                "Người dùng yêu cầu gửi lại mail mở tủ từ kiosk."
+                if force_resend and not email_changed
+                else "Đã cập nhật email mới từ kiosk, chuẩn bị gửi lại mail cho đơn đang còn trong tủ."
             )
+            item.email_link_base_url = current_base_url or None
             item.email_sent_at = None
 
         session.commit()
 
-    attempted, delivered = retry_email_delivery_for_phone(phone, email)
+    attempted = 0
+    delivered = 0
+    if email_changed or force_resend:
+        attempted, delivered = retry_email_delivery_for_phone(phone, email)
 
     with SessionLocal() as session:
         refreshed_orders = session.scalars(
             select(LockerOrder).where(LockerOrder.phone == phone).order_by(desc(LockerOrder.created_at))
         ).all()
 
-    if queued_count == 0:
+    if force_resend:
+        if queued_count == 0:
+            action = f"{action}; không có đơn đang lưu cần gửi lại email"
+        elif delivered == attempted and attempted == queued_count:
+            action = f"{action}; đã gửi lại email cho {delivered} đơn đang lưu"
+        elif delivered > 0:
+            action = f"{action}; đã gửi lại email cho {delivered}/{queued_count} đơn đang lưu"
+        else:
+            action = f"{action}; chưa gửi lại được email, kiểm tra lại SMTP Gmail"
+    elif not email_changed:
+        action = f"{action}; email trùng với email đã đăng ký gần nhất nên không gửi lại mail"
+    elif queued_count == 0:
         action = f"{action}; không có đơn đang lưu cần gửi lại email"
     elif delivered == attempted and attempted == queued_count:
         action = f"{action}; đã gửi lại email cho {delivered} đơn đang lưu"
@@ -3494,7 +3579,10 @@ def kiosk_user_portal_page(
                             value="{escape(email)}"
                         >
                     </div>
-                    <button class="submit-button" type="submit">Lưu và tra cứu</button>
+                    <div class="form-actions">
+                        <button class="submit-button secondary" type="submit" name="intent" value="lookup">Tra cứu</button>
+                        <button class="submit-button" type="submit" name="intent" value="resend">Lưu mail và gửi lại mail mới</button>
+                    </div>
                 </form>
                 {result_html}
             </section>
@@ -3799,76 +3887,61 @@ async def pickup_code_qr(pickup_code: str) -> Response:
 @app.get("/gui-do", response_class=HTMLResponse)
 async def user_dropoff_form() -> HTMLResponse:
     return HTMLResponse(
-        flow_page(
-            title="Gửi đồ",
-            subtitle="Người dùng phổ thông nhập số điện thoại để hệ thống cấp một tủ trống. Nếu số này đã đăng ký email, hệ thống sẽ tạo link nhận đồ an toàn.",
-            action="/gui-do",
-            fields=[
-                ("phone", "phone", "Số điện thoại", "Nhập số điện thoại người gửi", "numeric"),
-            ],
-            submit_label="Mở tủ để gửi đồ",
+        page_template(
+            "Chức năng đã ngừng",
+            """
+            <section class="hero">
+                <div>
+                    <h1>Đã ngừng gửi đồ phổ thông</h1>
+                    <p>Kiosk hiện chỉ còn hỗ trợ giao hàng và nhận hàng bằng mã mở tủ.</p>
+                </div>
+                <a class="home-link" href="/">Trang chủ</a>
+            </section>
+
+            <section class="panel">
+                <div class="result-panel error">
+                    <strong>Chức năng cũ đã được gỡ bỏ</strong>
+                    <ul>
+                        <li>Không còn hỗ trợ luồng gửi đồ phổ thông tại kiosk này.</li>
+                        <li>Nếu bạn cần lưu hàng vào tủ cho khách, hãy dùng mục <strong>Giao hàng</strong>.</li>
+                        <li>Nếu bạn đến nhận hàng, hãy dùng mục <strong>Nhận hàng</strong>.</li>
+                    </ul>
+                </div>
+                <div class="nav-row">
+                    <a class="nav-link warning" href="/giao-do">Sang giao hàng</a>
+                    <a class="nav-link primary" href="/nhan-do">Sang nhận hàng</a>
+                </div>
+            </section>
+            """,
         )
     )
 
 
 @app.post("/gui-do", response_class=HTMLResponse)
 async def user_dropoff(request: Request, phone: str = Form(...)) -> HTMLResponse:
-    try:
-        cleaned_phone = normalize_phone(phone)
-        recipient = get_registered_user(cleaned_phone)
-        record = create_record(
-            cleaned_phone,
-            "user_dropoff",
-            recipient_email=recipient.email if recipient is not None else None,
-            email_delivery_status="pending" if recipient is not None else "unregistered",
-            email_delivery_note="Đã tìm thấy email đăng ký." if recipient is not None else "Số điện thoại chưa đăng ký email.",
-        )
-        notice = "Vui lòng ghi nhớ mã này để nhận đồ sau."
-        if recipient is not None:
-            record, notice = queue_pickup_email_delivery(record, recipient.email, request)
-        result_html = result_panel(
-            "Đã mở tủ thành công",
-            [
-                f"Vị trí tủ đã mở: Tủ {record.locker_id}",
-                f"Mã mở tủ của bạn: {record.pickup_code}",
-                notice,
-            ],
-            highlights=[
-                ("Vị trí tủ", f"Tủ {record.locker_id}"),
-                ("Mã mở tủ", record.pickup_code),
-            ],
-            redirect_url="/",
-        )
-    except HTTPException as exc:
-        result_html = result_panel("Không thể mở tủ", [exc.detail], tone="error", redirect_url="/")
-    except OSError as exc:
-        if 'record' in locals() and recipient is not None:
-            record = update_record_email_delivery(record, recipient.email, "failed", str(exc))
-        result_html = result_panel(
-            "Đã mở tủ nhưng chưa gửi được email",
-            [
-                f"Vị trí tủ đã mở: Tủ {record.locker_id}" if 'record' in locals() else "Tủ đã được mở.",
-                f"Mã mở tủ của bạn: {record.pickup_code}" if 'record' in locals() else "Vui lòng kiểm tra lại mã mở tủ tại kiosk.",
-                str(exc),
-            ],
-            highlights=[
-                ("Vị trí tủ", f"Tủ {record.locker_id}"),
-                ("Mã mở tủ", record.pickup_code),
-            ] if 'record' in locals() else None,
-            tone="error",
-            redirect_url="/",
-        )
-
     return HTMLResponse(
-        flow_page(
-            title="Gửi đồ",
-            subtitle="Người dùng phổ thông nhập số điện thoại để hệ thống cấp một tủ trống.",
-            action="/gui-do",
-            fields=[
-                ("phone", "phone", "Số điện thoại", "Nhập số điện thoại người gửi", "numeric"),
-            ],
-            submit_label="Mở tủ để gửi đồ",
-            result_html=result_html,
+        page_template(
+            "Chức năng đã ngừng",
+            """
+            <section class="hero">
+                <div>
+                    <h1>Đã ngừng gửi đồ phổ thông</h1>
+                    <p>Kiosk hiện chỉ còn hỗ trợ giao hàng và nhận hàng bằng mã mở tủ.</p>
+                </div>
+                <a class="home-link" href="/">Trang chủ</a>
+            </section>
+
+            <section class="panel">
+                <div class="result-panel error">
+                    <strong>Không thể tiếp tục với chức năng cũ</strong>
+                    <p>Luồng gửi đồ phổ thông đã bị vô hiệu hóa. Hãy quay lại và dùng chức năng phù hợp hơn.</p>
+                </div>
+                <div class="nav-row">
+                    <a class="nav-link warning" href="/giao-do">Sang giao hàng</a>
+                    <a class="nav-link primary" href="/nhan-do">Sang nhận hàng</a>
+                </div>
+            </section>
+            """,
         )
     )
 
@@ -3877,14 +3950,14 @@ async def user_dropoff(request: Request, phone: str = Form(...)) -> HTMLResponse
 async def shipper_dropoff_form() -> HTMLResponse:
     return HTMLResponse(
         flow_page(
-            title="Giao đồ cho khách",
-            subtitle="Shipper nhập số điện thoại người nhận và mã đơn hàng. Hệ thống sẽ ưu tiên gửi link nhận đồ qua email nếu khách đã đăng ký trước.",
+            title="Giao hàng",
+            subtitle="Nhập số điện thoại người nhận và mã đơn hàng. Hệ thống sẽ ưu tiên gửi link nhận hàng qua email nếu khách đã đăng ký trước.",
             action="/giao-do",
             fields=[
                 ("phone", "phone", "Số điện thoại người nhận", "Nhập số điện thoại người nhận", "numeric"),
                 ("order_code", "order_code", "Mã đơn hàng", "Quét hoặc nhập mã đơn hàng", "full"),
             ],
-            submit_label="Lưu đồ vào tủ",
+            submit_label="Lưu hàng vào tủ",
         )
     )
 
@@ -3906,7 +3979,7 @@ async def shipper_dropoff(request: Request, phone: str = Form(...), order_code: 
         if recipient is not None:
             record, token_note = queue_pickup_email_delivery(record, recipient.email, request)
         result_html = result_panel(
-            "Đã lưu đồ vào tủ",
+            "Đã lưu hàng vào tủ",
             [
                 f"Vị trí tủ đã mở: Tủ {record.locker_id}",
                 f"Mã mở tủ tại kiosk: {record.pickup_code}",
@@ -3920,14 +3993,14 @@ async def shipper_dropoff(request: Request, phone: str = Form(...), order_code: 
             redirect_url="/",
         )
     except HTTPException as exc:
-        result_html = result_panel("Không thể lưu đồ", [exc.detail], tone="error", redirect_url="/")
+        result_html = result_panel("Không thể lưu hàng", [exc.detail], tone="error", redirect_url="/")
     except OSError as exc:
         if 'record' in locals() and recipient is not None:
             record = update_record_email_delivery(record, recipient.email, "failed", str(exc))
         result_html = result_panel(
-            "Đã lưu đồ nhưng chưa gửi được email",
+            "Đã lưu hàng nhưng chưa gửi được email",
             [
-                f"Vị trí tủ đã mở: Tủ {record.locker_id}" if 'record' in locals() else "Tủ đã được mở để lưu đồ.",
+                f"Vị trí tủ đã mở: Tủ {record.locker_id}" if 'record' in locals() else "Tủ đã được mở để lưu hàng.",
                 f"Mã mở tủ tại kiosk: {record.pickup_code}" if 'record' in locals() else "Vui lòng kiểm tra lại mã mở tủ tại kiosk.",
                 f"Mã đơn hàng: {record.order_code or '---'}" if 'record' in locals() else "Đơn hàng đã được lưu.",
                 str(exc),
@@ -3942,14 +4015,14 @@ async def shipper_dropoff(request: Request, phone: str = Form(...), order_code: 
 
     return HTMLResponse(
         flow_page(
-            title="Giao đồ cho khách",
-            subtitle="Shipper nhập số điện thoại người nhận và mã đơn hàng. Nếu khách đã đăng ký email, hệ thống sẽ phát link nhận đồ an toàn.",
+            title="Giao hàng",
+            subtitle="Nhập số điện thoại người nhận và mã đơn hàng. Nếu khách đã đăng ký email, hệ thống sẽ phát link nhận hàng an toàn.",
             action="/giao-do",
             fields=[
                 ("phone", "phone", "Số điện thoại người nhận", "Nhập số điện thoại người nhận", "numeric"),
                 ("order_code", "order_code", "Mã đơn hàng", "Quét hoặc nhập mã đơn hàng", "full"),
             ],
-            submit_label="Lưu đồ vào tủ",
+            submit_label="Lưu hàng vào tủ",
             result_html=result_html,
         )
     )
@@ -3959,14 +4032,14 @@ async def shipper_dropoff(request: Request, phone: str = Form(...), order_code: 
 async def receiver_form() -> HTMLResponse:
     return HTMLResponse(
         flow_page(
-            title="Nhận đồ",
+            title="Nhận hàng",
             subtitle="Người nhận nhập số điện thoại và mã mở tủ 6 số để lấy hàng.",
             action="/nhan-do",
             fields=[
                 ("phone", "phone", "Số điện thoại", "Nhập số điện thoại người nhận", "numeric"),
                 ("pickup_code", "pickup_code", "Mã mở tủ", "Nhập mã mở tủ 6 số", "numeric"),
             ],
-            submit_label="Mở tủ để nhận đồ",
+            submit_label="Mở tủ để nhận hàng",
         )
     )
 
@@ -3995,14 +4068,14 @@ async def receiver_pickup(phone: str = Form(...), pickup_code: str = Form(...)) 
 
     return HTMLResponse(
         flow_page(
-            title="Nhận đồ",
+            title="Nhận hàng",
             subtitle="Người nhận nhập số điện thoại và mã mở tủ 6 số để lấy hàng.",
             action="/nhan-do",
             fields=[
                 ("phone", "phone", "Số điện thoại", "Nhập số điện thoại người nhận", "numeric"),
                 ("pickup_code", "pickup_code", "Mã mở tủ", "Nhập mã mở tủ 6 số", "numeric"),
             ],
-            submit_label="Mở tủ để nhận đồ",
+            submit_label="Mở tủ để nhận hàng",
             result_html=result_html,
         )
     )
@@ -4230,16 +4303,25 @@ async def kiosk_user_portal_form() -> HTMLResponse:
 
 
 @app.post("/dang-ky-email", response_class=HTMLResponse)
-async def kiosk_user_portal_submit(phone: str = Form(...), email: str = Form(...)) -> HTMLResponse:
+async def kiosk_user_portal_submit(
+    phone: str = Form(...),
+    email: str = Form(...),
+    intent: str = Form("lookup"),
+) -> HTMLResponse:
     try:
         cleaned_phone = normalize_phone(phone)
         cleaned_email = normalize_email(email)
-        action, orders = sync_kiosk_user_email(cleaned_phone, cleaned_email)
+        resend_requested = intent == "resend"
+        action, orders = sync_kiosk_user_email(cleaned_phone, cleaned_email, force_resend=resend_requested)
         result_html = result_panel(
-            "Lưu và tra cứu thành công",
+            "Đã gửi lại mail" if resend_requested else "Lưu và tra cứu thành công",
             [
                 f"Hệ thống đã {action}.",
-                "Nếu số điện thoại này đang có đơn còn trong tủ, hệ thống sẽ cố gắng gửi lại email theo cấu hình hiện tại.",
+                (
+                    "Nếu có đơn đang còn trong tủ, hệ thống đã cố gắng gửi lại link mở tủ vào email này."
+                    if resend_requested
+                    else "Hệ thống chỉ gửi lại email khi email vừa nhập khác email đã đăng ký gần nhất cho số điện thoại này."
+                ),
             ],
             highlights=[
                 ("Số điện thoại", cleaned_phone),

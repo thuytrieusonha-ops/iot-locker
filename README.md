@@ -367,6 +367,14 @@ docker compose --env-file .env.docker up -d --build
 docker compose --env-file .env.docker --profile kiosk up -d kiosk
 ```
 
+Hoac dung script da chuan bi san:
+
+```bash
+chmod +x scripts/pi-up.sh scripts/pi-kiosk.sh scripts/pi-down.sh
+./scripts/pi-up.sh
+./scripts/pi-kiosk.sh
+```
+
 Neu Pi dong vai tro server that, nen dat them:
 
 - `SMARTLOCKER_BASE_URL` = IP LAN hoac domain that cua Pi cho cong `8000`
@@ -386,4 +394,42 @@ docker compose --env-file .env.docker ps
 docker compose --env-file .env.docker logs app
 docker compose --env-file .env.docker logs monitor
 docker compose --env-file .env.docker logs kiosk
+```
+
+## Dua len Git va chay ngay tren Raspberry Pi
+
+Repo nen dua len Git voi file mau, khong dua file bi mat that:
+
+- giu lai `.env.docker.example`
+- khong commit `.env`, `.env.docker`, `.kiosk_state.json`, `__pycache__`
+
+Quy trinh de xuat:
+
+```bash
+git init
+git rm --cached --ignore-unmatch .env .env.docker .kiosk_state.json
+git rm --cached -r --ignore-unmatch __pycache__
+git add .
+git status
+git commit -m "Initial Dockerized Smart Locker setup"
+git branch -M main
+git remote add origin <git-repo-url>
+git push -u origin main
+```
+
+Tren Raspberry Pi:
+
+```bash
+git clone <git-repo-url>
+cd smartlocker
+cp .env.docker.example .env.docker
+chmod +x scripts/pi-up.sh scripts/pi-kiosk.sh scripts/pi-down.sh
+./scripts/pi-up.sh
+./scripts/pi-kiosk.sh
+```
+
+Neu Pi chi chay server, khong can giao dien kiosk:
+
+```bash
+./scripts/pi-up.sh
 ```

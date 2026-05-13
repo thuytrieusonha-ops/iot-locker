@@ -21,6 +21,7 @@ class LockerOrder(Base):
     recipient_email: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     email_delivery_status: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
     email_delivery_note: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    email_link_base_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
     email_sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="stored", index=True)
 

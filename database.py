@@ -81,6 +81,8 @@ def ensure_schema_updates() -> None:
         statements.append("ALTER TABLE locker_orders ADD COLUMN email_delivery_status VARCHAR(20) NULL")
     if "email_delivery_note" not in existing_columns:
         statements.append("ALTER TABLE locker_orders ADD COLUMN email_delivery_note VARCHAR(255) NULL")
+    if "email_link_base_url" not in existing_columns:
+        statements.append("ALTER TABLE locker_orders ADD COLUMN email_link_base_url VARCHAR(255) NULL")
     if "email_sent_at" not in existing_columns:
         statements.append("ALTER TABLE locker_orders ADD COLUMN email_sent_at DATETIME NULL")
 

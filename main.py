@@ -1391,13 +1391,23 @@ def virtual_keyboard() -> str:
         "Z", "X", "C", "V", "B", "N", "M",
     ]
     full_buttons = "".join(
-        f'<button type="button" class="key" data-key="{key}">{key}</button>' for key in full_keys
+        (
+            f'<button type="button" class="key" data-letter="{key.lower()}">{key}</button>'
+            if key.isalpha()
+            else f'<button type="button" class="key" data-key="{key}">{key}</button>'
+        )
+        for key in full_keys
     )
     number_buttons = "".join(
         f'<button type="button" class="key" data-key="{key}">{key}</button>' for key in number_keys
     )
     email_buttons = "".join(
-        f'<button type="button" class="key" data-key="{key}">{key}</button>' for key in email_keys
+        (
+            f'<button type="button" class="key" data-letter="{key.lower()}">{key}</button>'
+            if key.isalpha()
+            else f'<button type="button" class="key" data-key="{key}">{key}</button>'
+        )
+        for key in email_keys
     )
     return f"""
     <div class="keyboard-shell">
@@ -1413,6 +1423,7 @@ def virtual_keyboard() -> str:
         </div>
         <div class="keyboard-grid keyboard-grid-full" data-keyboard-mode="full">
             {full_buttons}
+            <button type="button" class="key action wide" data-action="toggle-case">Chữ HOA</button>
             <button type="button" class="key wide" data-key="-">-</button>
             <button type="button" class="key wide" data-key=" ">Khoảng trắng</button>
             <button type="button" class="key action" data-action="backspace">Xóa</button>
@@ -1421,6 +1432,7 @@ def virtual_keyboard() -> str:
         </div>
         <div class="keyboard-grid keyboard-grid-email" data-keyboard-mode="email">
             {email_buttons}
+            <button type="button" class="key action wide" data-action="toggle-case">Chữ HOA</button>
             <button type="button" class="key" data-key="@">@</button>
             <button type="button" class="key" data-key=".">.</button>
             <button type="button" class="key" data-key="_">_</button>
@@ -1476,6 +1488,8 @@ def page_template(
             const closeButton = document.querySelector("[data-action='hide-keyboard']");
             const resultModal = document.querySelector("[data-result-modal]");
             const keyboardGrids = Array.from(document.querySelectorAll("[data-keyboard-mode]"));
+            const letterButtons = Array.from(document.querySelectorAll(".keyboard-shell [data-letter]"));
+            const caseToggleButtons = Array.from(document.querySelectorAll(".keyboard-shell [data-action='toggle-case']"));
             const resultRedirectUrl = resultModal?.dataset.redirectUrl || "";
             const resultRedirectDelay = Number(resultModal?.dataset.redirectDelay || 0);
             const liveClock = document.querySelector("[data-live-clock]");
@@ -1483,6 +1497,7 @@ def page_template(
             const adminAlertHost = document.querySelector("[data-admin-alert-host]");
             let activeField = null;
             let redirectTimer = null;
+            let keyboardUppercase = false;
             let lastAdminAlertId = Number(window.sessionStorage.getItem("smartlocker_admin_alert_id") || 0);
             let lastPickupHandoffId = Number(window.sessionStorage.getItem("smartlocker_pickup_handoff_id") || 0);
 
@@ -1560,6 +1575,16 @@ def page_template(
                 });
             };
 
+            const updateLetterKeys = () => {
+                letterButtons.forEach((button) => {
+                    const letter = button.dataset.letter || "";
+                    button.textContent = keyboardUppercase ? letter.toUpperCase() : letter.toLowerCase();
+                });
+                caseToggleButtons.forEach((button) => {
+                    button.textContent = keyboardUppercase ? "Chữ HOA" : "chữ thường";
+                });
+            };
+
             const setActive = (field) => {
                 if (!field) return;
                 fields.forEach((item) => item.classList.remove("active-input"));
@@ -1567,29 +1592,46 @@ def page_template(
                 activeField.classList.add("active-input");
                 applyKeyboardMode(activeField);
                 showKeyboard();
-                activeField.focus();
                 ensureFieldVisible(activeField);
             };
 
             fields.forEach((field) => {
                 field.addEventListener("pointerdown", (event) => {
                     event.preventDefault();
+                    event.stopPropagation();
                     setActive(field);
                 });
+                field.addEventListener("click", (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                });
                 field.addEventListener("focus", () => setActive(field));
-                field.addEventListener("click", () => setActive(field));
             });
+
+            if (keyboard) {
+                keyboard.addEventListener("pointerdown", (event) => {
+                    event.stopPropagation();
+                });
+                keyboard.addEventListener("click", (event) => {
+                    event.stopPropagation();
+                });
+            }
 
             document.querySelectorAll(".keyboard-shell .key").forEach((button) => {
                 button.addEventListener("click", () => {
                     if (!activeField) return;
                     const action = button.dataset.action;
-                    const key = button.dataset.key || "";
+                    const key = button.dataset.letter
+                        ? (keyboardUppercase ? button.dataset.letter.toUpperCase() : button.dataset.letter.toLowerCase())
+                        : (button.dataset.key || "");
 
                     if (action === "backspace") {
                         activeField.value = activeField.value.slice(0, -1);
                     } else if (action === "clear") {
                         activeField.value = "";
+                    } else if (action === "toggle-case") {
+                        keyboardUppercase = !keyboardUppercase;
+                        updateLetterKeys();
                     } else if (action === "next") {
                         const index = fields.indexOf(activeField);
                         const nextField = fields[(index + 1) % fields.length];
@@ -1599,7 +1641,6 @@ def page_template(
                     }
 
                     activeField.dispatchEvent(new Event("input", { bubbles: true }));
-                    activeField.focus();
                     ensureFieldVisible(activeField);
                 });
             });
@@ -1625,7 +1666,7 @@ def page_template(
                 }
             }
 
-            document.addEventListener("click", (event) => {
+            document.addEventListener("pointerdown", (event) => {
                 const target = event.target;
                 if (!(target instanceof Element)) return;
                 if (target.closest(".keyboard-shell") || target.closest("[data-touch-input='true']") || target.closest(".result-modal")) return;
@@ -1639,6 +1680,7 @@ def page_template(
 
             updateLiveTime();
             window.setInterval(updateLiveTime, 1000);
+            updateLetterKeys();
             updateKeyboardSpace();
 
 """ + ("""
@@ -3369,6 +3411,7 @@ def flow_page(
                 placeholder="{escape(placeholder)}"
                 autocomplete="off"
                 inputmode="none"
+                readonly
                 data-touch-input="true"
                 data-keyboard-mode="{keyboard_mode}"
                 required
@@ -3565,6 +3608,7 @@ def kiosk_user_portal_page(
                             placeholder="Nhập số điện thoại"
                             autocomplete="off"
                             inputmode="none"
+                            readonly
                             data-touch-input="true"
                             data-keyboard-mode="numeric"
                             required
@@ -3579,6 +3623,7 @@ def kiosk_user_portal_page(
                             placeholder="Nhập email nhận thông báo"
                             autocomplete="off"
                             inputmode="none"
+                            readonly
                             data-touch-input="true"
                             data-keyboard-mode="email"
                             required
@@ -3695,6 +3740,7 @@ def issue_report_page(result_html: str = "", selected_issue_type: str = "", cont
                             placeholder="Nhập số điện thoại nếu cần phản hồi"
                             autocomplete="off"
                             inputmode="none"
+                            readonly
                             data-touch-input="true"
                             data-keyboard-mode="numeric"
                             value="{escape(contact_phone)}"
@@ -3708,6 +3754,7 @@ def issue_report_page(result_html: str = "", selected_issue_type: str = "", cont
                             placeholder="Nhập mã tủ hoặc mã đơn liên quan"
                             autocomplete="off"
                             inputmode="none"
+                            readonly
                             data-touch-input="true"
                             data-keyboard-mode="full"
                             value="{escape(issue_code)}"
@@ -3799,6 +3846,7 @@ def pickup_link_page(
                             placeholder="Nhập 4 số cuối"
                             autocomplete="off"
                             inputmode="none"
+                            readonly
                             data-touch-input="true"
                             data-keyboard-mode="numeric"
                             required
@@ -3848,6 +3896,7 @@ def pickup_code_page(
                             placeholder="Nhập 4 số cuối"
                             autocomplete="off"
                             inputmode="none"
+                            readonly
                             data-touch-input="true"
                             data-keyboard-mode="numeric"
                             required

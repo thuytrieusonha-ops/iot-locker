@@ -1,9 +1,9 @@
-tunnel: smartlocker
+tunnel: b87dc12c-7ad8-4d75-a953-749f1c60722c
 credentials-file: /etc/cloudflared/credentials.json
 
 ingress:
-  - hostname: monitor-smartlocker.example.com
+  - hostname: monitor.smartlockerhcmute.dpdns.org
     service: http://monitor:8001
-  - hostname: app-smartlocker.example.com
+  - hostname: app.smartlockerhcmute.dpdns.org
     service: http://app:8000
   - service: http_status:404

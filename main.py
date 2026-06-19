@@ -115,7 +115,7 @@ BASE_URL = os.getenv("SMARTLOCKER_BASE_URL", "").strip().rstrip("/")
 MONITOR_URL = os.getenv("SMARTLOCKER_MONITOR_URL", "").strip().rstrip("/")
 MONITOR_USER_PORTAL_URL = os.getenv(
     "SMARTLOCKER_USER_PORTAL_URL",
-    "https://monitor.smartlockerhcmute.dpdns.org/portal",
+    "https://app.smartlockerhcmute.dpdns.org/dang-ky-email",
 ).strip().rstrip("/")
 APP_HOST = env_str("SMARTLOCKER_APP_HOST", "0.0.0.0") or "0.0.0.0"
 APP_PORT = env_int("SMARTLOCKER_APP_PORT", 8000)

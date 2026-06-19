@@ -113,6 +113,10 @@ SMTP_RETRY_ATTEMPTS = max(1, int(os.getenv("SMARTLOCKER_SMTP_RETRY_ATTEMPTS", "3
 SMTP_RETRY_DELAY_SECONDS = max(5, int(os.getenv("SMARTLOCKER_SMTP_RETRY_DELAY_SECONDS", "20") or "20"))
 BASE_URL = os.getenv("SMARTLOCKER_BASE_URL", "").strip().rstrip("/")
 MONITOR_URL = os.getenv("SMARTLOCKER_MONITOR_URL", "").strip().rstrip("/")
+MONITOR_USER_PORTAL_URL = os.getenv(
+    "SMARTLOCKER_USER_PORTAL_URL",
+    "https://monitor.smartlockerhcmute.dpdns.org/portal",
+).strip().rstrip("/")
 APP_HOST = env_str("SMARTLOCKER_APP_HOST", "0.0.0.0") or "0.0.0.0"
 APP_PORT = env_int("SMARTLOCKER_APP_PORT", 8000)
 KIOSK_STATE_FILE = Path(__file__).resolve().parent / ".kiosk_state.json"
@@ -301,6 +305,9 @@ def build_pickup_code_qr_url(pickup_code: str, request: Request | None = None) -
 
 
 def get_monitor_user_portal_url() -> str:
+    direct_portal_url = current_configured_url("SMARTLOCKER_USER_PORTAL_URL", MONITOR_USER_PORTAL_URL)
+    if direct_portal_url:
+        return direct_portal_url
     monitor_url = current_configured_url("SMARTLOCKER_MONITOR_URL", MONITOR_URL)
     if monitor_url:
         return f"{monitor_url}/portal"

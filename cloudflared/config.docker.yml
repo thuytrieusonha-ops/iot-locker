@@ -3,7 +3,7 @@ credentials-file: /etc/cloudflared/credentials.json
 
 ingress:
   - hostname: monitor.smartlockerhcmute.dpdns.org
-    service: http://monitor:8001
+    service: http://smartlocker-monitor:8001
   - hostname: app.smartlockerhcmute.dpdns.org
-    service: http://app:8000
+    service: http://smartlocker-app:8000
   - service: http_status:404

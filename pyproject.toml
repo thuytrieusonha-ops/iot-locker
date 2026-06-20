@@ -6,6 +6,8 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.136.0",
+    "paho-mqtt>=2.1.0",
+    "pyserial>=3.5",
     "pyqt6>=6.8.1",
     "pyqt6-webengine>=6.8.0",
     "pywebview>=5.4",

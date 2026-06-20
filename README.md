@@ -10,6 +10,7 @@ The project is designed for a smart locker kiosk scenario where staff or shipper
 - `monitor.py`: the user portal and admin dashboard
 - `kiosk.py`: a kiosk window launcher for touchscreen devices
 - MySQL persistence for locker orders, users, access tokens, and admin commands
+- MQTT communication between the web app and locker controller
 - Optional email delivery for secure pickup links
 - Docker Compose setup for local or small server deployment
 
@@ -29,6 +30,7 @@ The project is designed for a smart locker kiosk scenario where staff or shipper
 - Python 3.12
 - FastAPI
 - SQLAlchemy
+- MQTT / Eclipse Mosquitto
 - MySQL
 - PyQt6 / PyWebView
 - Docker Compose
@@ -36,6 +38,8 @@ The project is designed for a smart locker kiosk scenario where staff or shipper
 ## Project Structure
 
 - `main.py` - main web app for locker operations
+- `locker_hardware.py` - MQTT client used by the web app
+- `locker_gateway.py` - Raspberry Pi MQTT-to-UART bridge for Arduino Mega
 - `monitor.py` - portal and admin dashboard
 - `kiosk.py` - kiosk browser window
 - `database.py` - database engine and session setup
@@ -277,6 +281,74 @@ SMARTLOCKER_SMTP_FROM_EMAIL="your-email@gmail.com"
 SMARTLOCKER_SMTP_USE_TLS="true"
 ```
 
+Optional MQTT locker control:
+
+```bash
+SMARTLOCKER_HARDWARE_ENABLED="true"
+SMARTLOCKER_HARDWARE_REQUIRED="true"
+SMARTLOCKER_MQTT_HOST="127.0.0.1"
+SMARTLOCKER_MQTT_PORT="1883"
+SMARTLOCKER_MQTT_TOPIC_PREFIX="smartlocker"
+SMARTLOCKER_MQTT_CLIENT_ID="smartlocker-app"
+SMARTLOCKER_MQTT_QOS="1"
+SMARTLOCKER_MQTT_COMMAND_TIMEOUT="5.0"
+SMARTLOCKER_GATEWAY_MQTT_CLIENT_ID="smartlocker-pi-gateway"
+SMARTLOCKER_UART_PORT="/dev/serial0"
+SMARTLOCKER_UART_BAUDRATE="9600"
+SMARTLOCKER_UART_COMMAND_TIMEOUT="3.0"
+```
+
+`SMARTLOCKER_HARDWARE_REQUIRED=false` allows the web flow to simulate hardware when the broker or controller is unavailable. Set it to `true` in production so an order is not completed without a controller acknowledgement.
+
+### MQTT protocol
+
+With the default `smartlocker` prefix, the app and locker controller use these topics:
+
+- App publishes commands to `smartlocker/lockers/{locker_id}/command`.
+- Controller publishes acknowledgements to `smartlocker/lockers/{locker_id}/ack`.
+- Controller can publish door and sensor events to `smartlocker/lockers/{locker_id}/event`.
+
+Open command payload:
+
+```json
+{"command":"open","locker_id":1,"request_id":"a-unique-request-id"}
+```
+
+The controller must echo the same `request_id` before `SMARTLOCKER_MQTT_COMMAND_TIMEOUT` expires:
+
+```json
+{"request_id":"a-unique-request-id","locker_id":1,"status":"opened"}
+```
+
+Accepted success statuses are `ok`, `opened`, and `accepted`. Occupancy changes use the same command topic and do not require an acknowledgement:
+
+```json
+{"command":"set_occupied","locker_id":1,"occupied":true}
+```
+
+### Raspberry Pi to Arduino Mega UART
+
+MQTT does not replace the physical UART connection. `locker_gateway.py` runs on the Raspberry Pi and translates between the two protocols:
+
+```text
+Web app -> MQTT broker -> Raspberry Pi gateway -> UART -> Arduino Mega
+Web app <- MQTT ACK    <- Raspberry Pi gateway <- UART <- Arduino Mega
+```
+
+UART commands sent by the Pi:
+
+- `OPEN,{locker_id}`
+- `LOCKER_USED,{locker_id}`
+- `LOCKER_EMPTY,{locker_id}`
+
+UART messages sent by the Mega:
+
+- `OK,{locker_id}` acknowledges an open command.
+- `DOOR_OPEN,{locker_id}` publishes a `door_open` MQTT event.
+- `DOOR_CLOSED,{locker_id}` publishes a `door_closed` MQTT event.
+
+Only one open command is sent to the Mega at a time, allowing its `OK,{locker_id}` response to be correlated with the MQTT `request_id`.
+
 ### 3. Create the database
 
 ```bash
@@ -316,13 +388,19 @@ Default services:
 - app: `http://localhost:8000`
 - monitor: `http://localhost:8001`
 - mysql: `localhost:3307`
+- mqtt: `localhost:1883`
 
 Optional profiles in `docker-compose.yml`:
 
+- `hardware` for the Raspberry Pi MQTT-to-UART gateway
 - `kiosk` for kiosk container
 - `tunnel` for Cloudflare Tunnel container
 
 Examples:
+
+```bash
+docker compose --profile hardware up --build
+```
 
 ```bash
 docker compose --profile kiosk up --build

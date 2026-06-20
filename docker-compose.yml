@@ -8,6 +8,16 @@ x-smartlocker-db-env: &smartlocker-db-env
   SMARTLOCKER_DATABASE_PASSWORD: ${MYSQL_PASSWORD:-Locker123!}
 
 services:
+  mqtt:
+    image: eclipse-mosquitto:2
+    container_name: smartlocker-mqtt
+    restart: unless-stopped
+    ports:
+      - "${SMARTLOCKER_MQTT_HOST_PORT:-1883}:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mqtt-data:/mosquitto/data
+
   mysql:
     image: mysql:8.4
     container_name: smartlocker-mysql
@@ -42,10 +52,15 @@ services:
       <<: *smartlocker-db-env
       SMARTLOCKER_APP_HOST: 0.0.0.0
       SMARTLOCKER_APP_PORT: 8000
+      SMARTLOCKER_MQTT_HOST: ${SMARTLOCKER_MQTT_HOST:-mqtt}
     command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
     ports:
       - "${SMARTLOCKER_APP_HOST_PORT:-8000}:8000"
+    volumes:
+      - ./order_photos:/app/order_photos
     depends_on:
+      mqtt:
+        condition: service_started
       mysql:
         condition: service_healthy
     healthcheck:
@@ -54,6 +69,26 @@ services:
       timeout: 5s
       retries: 10
       start_period: 20s
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: server
+    container_name: smartlocker-pi-gateway
+    restart: unless-stopped
+    profiles:
+      - hardware
+    env_file:
+      - .env.docker
+    environment:
+      SMARTLOCKER_MQTT_HOST: ${SMARTLOCKER_MQTT_HOST:-mqtt}
+    command: ["python", "locker_gateway.py"]
+    devices:
+      - "${SMARTLOCKER_UART_PORT:-/dev/serial0}:${SMARTLOCKER_UART_PORT:-/dev/serial0}"
+    depends_on:
+      mqtt:
+        condition: service_started
 
   monitor:
     build:
@@ -71,6 +106,8 @@ services:
     command: ["uvicorn", "monitor:app", "--host", "0.0.0.0", "--port", "8001"]
     ports:
       - "${SMARTLOCKER_MONITOR_HOST_PORT:-8001}:8001"
+    volumes:
+      - ./order_photos:/app/order_photos
     depends_on:
       mysql:
         condition: service_healthy
@@ -106,6 +143,7 @@ services:
         condition: service_healthy
     volumes:
       - ./.kiosk_state.json:/app/.kiosk_state.json
+      - ./order_photos:/app/order_photos
       - /tmp/.X11-unix:/tmp/.X11-unix
     devices:
       - /dev/dri:/dev/dri
@@ -129,3 +167,4 @@ services:
 
 volumes:
   mysql-data:
+  mqtt-data:

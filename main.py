@@ -25,7 +25,17 @@ from sqlalchemy.orm import Session
 
 from config import build_local_url, env_int, env_str
 from database import SessionLocal, init_db, is_database_configured
+from locker_hardware import (
+    HARDWARE_ENABLED,
+    LockerHardwareError,
+    close_hardware,
+    mark_locker_empty,
+    mark_locker_used,
+    open_locker,
+    start_hardware,
+)
 from model import AdminCommand, LockerAccessToken, LockerOrder, UserAccount
+from order_camera import OrderPhotoError, find_order_photo, save_order_photo
 
 
 app = FastAPI(title="Smart Locker UI", version="1.0.0")
@@ -128,6 +138,14 @@ def startup() -> None:
         init_db()
     except SQLAlchemyError as exc:
         print(f"[smartlocker] Database startup warning: {exc}")
+    if HARDWARE_ENABLED:
+        print("[smartlocker] Locker MQTT hardware enabled.")
+        start_hardware()
+
+
+@app.on_event("shutdown")
+def shutdown() -> None:
+    close_hardware()
 
 
 def database_unavailable_page() -> str:
@@ -367,6 +385,7 @@ def send_pickup_email(
     pickup_code: str,
     flow: str,
     order_code: str | None = None,
+    order_photo_path: Path | None = None,
 ) -> tuple[bool, str]:
     if not email_delivery_enabled():
         return False, "Chưa cấu hình SMTP nên chưa thể gửi link tự động."
@@ -385,6 +404,9 @@ def send_pickup_email(
         code_label = "Mã mở tủ dự phòng"
         order_lines = []
     order_html = f"<p><strong>Mã đơn hàng:</strong> {escape(order_code)}</p>" if order_code and flow == "shipper_dropoff" else ""
+    photo_available = order_photo_path is not None and order_photo_path.is_file()
+    photo_lines = ["Ảnh chụp đơn hàng được đính kèm trong email này."] if photo_available else []
+    photo_html = "<p><strong>Ảnh đơn hàng:</strong> Xem tệp JPEG đính kèm trong email.</p>" if photo_available else ""
     qr_png = build_pickup_code_qr_png(pickup_code) if SMTP_INCLUDE_QR else None
     qr_html = ""
     if qr_png:
@@ -409,6 +431,7 @@ def send_pickup_email(
         f"Tủ: {locker_line}",
         f"Link nhận đồ: {pickup_url}",
         *order_lines,
+        *photo_lines,
         f"{code_label}: {pickup_code}",
         f"Hết hạn: {now_text(expires_at)}",
         "",
@@ -425,6 +448,7 @@ def send_pickup_email(
                 <p>{escape(intro)}</p>
                 <p><strong>Tủ:</strong> {escape(locker_line)}</p>
                 {order_html}
+                {photo_html}
                 <p><strong>{escape(code_label)}:</strong> {escape(pickup_code)}</p>
                 <p><strong>Hết hạn:</strong> {escape(now_text(expires_at))}</p>
                 <p>
@@ -445,6 +469,17 @@ def send_pickup_email(
     if qr_png:
         html_part = message.get_payload()[-1]
         html_part.add_related(qr_png, maintype="image", subtype="png", cid="<pickup-code-qr>")
+    photo_attached = False
+    if photo_available and order_photo_path is not None:
+        photo_bytes = order_photo_path.read_bytes()
+        if photo_bytes:
+            message.add_attachment(
+                photo_bytes,
+                maintype="image",
+                subtype="jpeg",
+                filename=order_photo_path.name,
+            )
+            photo_attached = True
 
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
         smtp.ehlo()
@@ -454,10 +489,19 @@ def send_pickup_email(
         if SMTP_USERNAME:
             smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
         smtp.send_message(message)
+    if photo_attached:
+        return True, "Đã gửi link nhận đồ và ảnh chụp đơn hàng qua email đã đăng ký."
     return True, "Đã gửi link nhận đồ qua email đã đăng ký."
 
 
-def deliver_pickup_email(record: LockerRecord, email: str, request: Request | None = None) -> tuple[LockerRecord, bool, str]:
+def deliver_pickup_email(
+    record: LockerRecord,
+    email: str,
+    request: Request | None = None,
+    order_photo_path: Path | None = None,
+) -> tuple[LockerRecord, bool, str]:
+    if order_photo_path is None:
+        order_photo_path = find_order_photo(record.pickup_code)
     active_base_url = get_base_url(request)
     _, pickup_link, expires_at = issue_pickup_access(record, email, request)
     sent, delivery_note = send_pickup_email(
@@ -468,6 +512,7 @@ def deliver_pickup_email(record: LockerRecord, email: str, request: Request | No
         record.pickup_code,
         record.flow,
         record.order_code,
+        order_photo_path,
     )
     updated_record = update_record_email_delivery(
         record,
@@ -494,7 +539,14 @@ def is_retryable_email_error(exc: BaseException) -> bool:
     return False
 
 
-def queue_pickup_email_delivery(record: LockerRecord, email: str, request: Request | None = None) -> tuple[LockerRecord, str]:
+def queue_pickup_email_delivery(
+    record: LockerRecord,
+    email: str,
+    request: Request | None = None,
+    order_photo_path: Path | None = None,
+) -> tuple[LockerRecord, str]:
+    if order_photo_path is None:
+        order_photo_path = find_order_photo(record.pickup_code)
     active_base_url = get_base_url(request)
     _, pickup_link, expires_at = issue_pickup_access(record, email, request)
     queued_record = update_record_email_delivery(
@@ -527,6 +579,7 @@ def queue_pickup_email_delivery(record: LockerRecord, email: str, request: Reque
                     record.pickup_code,
                     record.flow,
                     record.order_code,
+                    order_photo_path,
                 )
                 update_record_email_delivery(
                     queued_record,
@@ -556,6 +609,8 @@ def queue_pickup_email_delivery(record: LockerRecord, email: str, request: Reque
         )
 
     Thread(target=worker, daemon=True).start()
+    if order_photo_path is not None:
+        return queued_record, "Hệ thống đang gửi link nhận đồ kèm ảnh chụp đơn hàng qua email. Vui lòng kiểm tra hộp thư và thư rác trong ít phút."
     return queued_record, "Hệ thống đang gửi link nhận đồ qua email. Vui lòng kiểm tra hộp thư và thư rác trong ít phút."
 
 
@@ -591,6 +646,12 @@ def retry_email_delivery_for_phone(phone: str, email: str, request: Request | No
 
 def generate_pickup_code() -> str:
     return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def user_error_message(exc: HTTPException | LockerHardwareError) -> str:
+    if isinstance(exc, HTTPException):
+        return str(exc.detail)
+    return str(exc)
 
 
 def to_record(item: LockerOrder) -> LockerRecord:
@@ -996,6 +1057,51 @@ def claim_pending_unlock_command_for_display() -> AdminCommand | None:
     return command
 
 
+def complete_unlock_command(command_id: int, note: str) -> None:
+    if not using_database():
+        return
+
+    assert SessionLocal is not None
+    with SessionLocal() as session:
+        command = session.get(AdminCommand, command_id)
+        if command is None:
+            return
+        command.status = "completed"
+        command.note = " | ".join(part for part in [command.note or "", note] if part)
+        command.completed_at = datetime.now()
+        session.commit()
+
+
+def execute_admin_unlock_command(command: AdminCommand) -> str:
+    locker_ids, _ = parse_unlock_command_note(command.note)
+    if command.action == "unlock_all_lockers":
+        target_ids = list(range(1, LOCKER_COUNT + 1))
+    else:
+        target_ids = [locker_id for locker_id in locker_ids if 1 <= locker_id <= LOCKER_COUNT]
+
+    if not target_ids:
+        message = "Không có tủ hợp lệ để mở."
+        complete_unlock_command(command.id, f"kiosk_result={message}")
+        return message
+
+    opened_ids: list[int] = []
+    failed_messages: list[str] = []
+    for locker_id in target_ids:
+        try:
+            open_locker(locker_id)
+            opened_ids.append(locker_id)
+        except LockerHardwareError as exc:
+            failed_messages.append(f"Tủ {locker_id}: {exc}")
+
+    if failed_messages:
+        message = "; ".join(failed_messages)
+    else:
+        message = "Đã gửi lệnh mở " + ", ".join(f"Tủ {locker_id}" for locker_id in opened_ids)
+
+    complete_unlock_command(command.id, f"kiosk_result={message}")
+    return message
+
+
 def admin_command_banner() -> str:
     return ""
 
@@ -1029,6 +1135,7 @@ def admin_command_modal() -> str:
     command = claim_pending_unlock_command_for_display()
     if command is None:
         return ""
+    execute_admin_unlock_command(command)
     return render_admin_command_modal(command)
 
 
@@ -1037,6 +1144,7 @@ def admin_command_payload() -> dict[str, object]:
     if command is None:
         return {"has_pending": False, "html": "", "modal_html": ""}
 
+    hardware_result = execute_admin_unlock_command(command)
     return {
         "has_pending": True,
         "id": command.id,
@@ -1044,6 +1152,7 @@ def admin_command_payload() -> dict[str, object]:
         "action_label": ADMIN_ACTION_LABELS.get(command.action, command.action),
         "created_at": now_text(command.created_at),
         "note": command.note or "",
+        "hardware_result": hardware_result,
         "html": "",
         "modal_html": render_admin_command_modal(command),
     }
@@ -1150,6 +1259,52 @@ def create_record(
             session.commit()
             session.refresh(item)
             return to_record(item)
+
+
+def release_record(record: LockerRecord) -> None:
+    with state_lock:
+        if not using_database():
+            for locker_id, locker_record in lockers.items():
+                if locker_record and locker_record.phone == record.phone and locker_record.pickup_code == record.pickup_code:
+                    locker_record.status = "collected"
+                    lockers[locker_id] = None
+                    return
+            return
+
+        assert SessionLocal is not None
+        with SessionLocal() as session:
+            item = session.scalar(
+                select(LockerOrder).where(
+                    LockerOrder.locker_id == record.locker_id,
+                    LockerOrder.phone == record.phone,
+                    LockerOrder.pickup_code == record.pickup_code,
+                    LockerOrder.status == "stored",
+                )
+            )
+            if item is not None:
+                item.status = "collected"
+                session.commit()
+
+
+def get_record_by_phone_pickup(phone: str, pickup_code: str) -> LockerRecord:
+    if not using_database():
+        for record in lockers.values():
+            if record and record.phone == phone and record.pickup_code == pickup_code and record.status == "stored":
+                return record
+        raise HTTPException(status_code=404, detail="Không tìm thấy đơn phù hợp với số điện thoại và mã mở tủ.")
+
+    assert SessionLocal is not None
+    with SessionLocal() as session:
+        item = session.scalar(
+            select(LockerOrder).where(
+                LockerOrder.phone == phone,
+                LockerOrder.pickup_code == pickup_code,
+                LockerOrder.status == "stored",
+            )
+        )
+        if item is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy đơn phù hợp với số điện thoại và mã mở tủ.")
+        return to_record(item)
 
 
 def collect_record(phone: str, pickup_code: str) -> LockerRecord:
@@ -1338,6 +1493,7 @@ def result_panel(
     title: str,
     lines: list[str],
     highlights: list[tuple[str, str]] | None = None,
+    stacked_highlights: bool = False,
     tone: str = "success",
     redirect_url: str | None = None,
     redirect_delay_ms: int = 2500,
@@ -1358,7 +1514,8 @@ def result_panel(
             """
             for label, value in highlights
         )
-        highlight_html = f'<div class="result-highlight-grid">{cards}</div>'
+        highlight_class = "result-highlight-grid stacked" if stacked_highlights else "result-highlight-grid"
+        highlight_html = f'<div class="{highlight_class}">{cards}</div>'
 
     redirect_attrs = ""
     if redirect_url:
@@ -1424,7 +1581,7 @@ def virtual_keyboard() -> str:
         </div>
         <div class="keyboard-grid keyboard-grid-numeric" data-keyboard-mode="numeric">
             {number_buttons}
-            <button type="button" class="key action" data-action="backspace">Xóa</button>
+            <button type="button" class="key action backspace-key" data-action="backspace">⌫ Xóa 1 ký tự</button>
             <button type="button" class="key action" data-action="clear">Làm trống</button>
             <button type="button" class="key action" data-action="next">Ô kế tiếp</button>
         </div>
@@ -1433,7 +1590,7 @@ def virtual_keyboard() -> str:
             <button type="button" class="key action wide" data-action="toggle-case">Chữ HOA</button>
             <button type="button" class="key wide" data-key="-">-</button>
             <button type="button" class="key wide" data-key=" ">Khoảng trắng</button>
-            <button type="button" class="key action" data-action="backspace">Xóa</button>
+            <button type="button" class="key action backspace-key" data-action="backspace">⌫ Xóa 1 ký tự</button>
             <button type="button" class="key action" data-action="clear">Làm trống</button>
             <button type="button" class="key action" data-action="next">Ô kế tiếp</button>
         </div>
@@ -1445,7 +1602,7 @@ def virtual_keyboard() -> str:
             <button type="button" class="key" data-key="_">_</button>
             <button type="button" class="key" data-key="-">-</button>
             <button type="button" class="key wide" data-key=".com">.com</button>
-            <button type="button" class="key action" data-action="backspace">Xóa</button>
+            <button type="button" class="key action backspace-key" data-action="backspace">⌫ Xóa 1 ký tự</button>
             <button type="button" class="key action" data-action="clear">Làm trống</button>
             <button type="button" class="key action" data-action="next">Ô kế tiếp</button>
         </div>
@@ -1502,9 +1659,31 @@ def page_template(
             const liveClock = document.querySelector("[data-live-clock]");
             const liveDate = document.querySelector("[data-live-date]");
             const adminAlertHost = document.querySelector("[data-admin-alert-host]");
+            const scrollControl = document.querySelector("[data-scroll-control]");
+            const scrollTrack = document.querySelector("[data-scroll-track]");
+            const scrollThumb = document.querySelector("[data-scroll-thumb]");
+            const scrollUpButton = document.querySelector("[data-scroll-up]");
+            const scrollDownButton = document.querySelector("[data-scroll-down]");
+            const cameraModal = document.querySelector("[data-order-camera-modal]");
+            const cameraVideo = document.querySelector("[data-order-camera-video]");
+            const cameraStatus = document.querySelector("[data-order-camera-status]");
+            const cameraCountdown = document.querySelector("[data-order-camera-countdown]");
+            const cameraCaptureButton = document.querySelector("[data-capture-order-photo]");
+            const cameraOpenButton = document.querySelector("[data-open-order-camera]");
+            const cameraPhotoData = document.querySelector("[data-order-photo-data]");
+            const cameraPreview = document.querySelector("[data-order-camera-preview]");
+            const cameraPreviewImage = document.querySelector("[data-order-camera-preview-image]");
             let activeField = null;
             let redirectTimer = null;
             let keyboardUppercase = false;
+            let scannerBuffer = "";
+            let scannerLastKeyAt = 0;
+            const scannerTarget = document.querySelector("[data-scanner-input='true']");
+            const scannerMaxKeyGapMs = 120;
+            let scrollDragStartY = 0;
+            let scrollDragStartTop = 0;
+            let cameraStream = null;
+            let cameraCountdownTimer = null;
             let lastAdminAlertId = Number(window.sessionStorage.getItem("smartlocker_admin_alert_id") || 0);
             let lastPickupHandoffId = Number(window.sessionStorage.getItem("smartlocker_pickup_handoff_id") || 0);
 
@@ -1535,6 +1714,153 @@ def page_template(
                 const height = keyboard.classList.contains("visible") ? keyboard.offsetHeight : 0;
                 document.documentElement.style.setProperty("--keyboard-space", `${height + 28}px`);
             };
+
+            const updateScrollControl = () => {
+                if (!scrollControl || !scrollTrack || !scrollThumb) return;
+                const pageHeight = document.documentElement.scrollHeight;
+                const maxScroll = Math.max(0, pageHeight - window.innerHeight);
+                scrollControl.classList.toggle("is-hidden", maxScroll <= 2);
+                if (maxScroll <= 2) return;
+
+                const trackHeight = scrollTrack.clientHeight;
+                const thumbHeight = Math.max(72, trackHeight * (window.innerHeight / pageHeight));
+                const maxThumbTop = Math.max(0, trackHeight - thumbHeight);
+                const thumbTop = maxScroll ? (window.scrollY / maxScroll) * maxThumbTop : 0;
+                scrollThumb.style.height = `${Math.min(trackHeight, thumbHeight)}px`;
+                scrollThumb.style.transform = `translateY(${thumbTop}px)`;
+            };
+
+            const scrollOnePage = (direction) => {
+                window.scrollBy({ top: direction * window.innerHeight * 0.72, behavior: "smooth" });
+            };
+
+            if (scrollControl && scrollTrack && scrollThumb) {
+                scrollControl.addEventListener("pointerdown", (event) => event.stopPropagation());
+                scrollUpButton?.addEventListener("click", () => scrollOnePage(-1));
+                scrollDownButton?.addEventListener("click", () => scrollOnePage(1));
+
+                scrollThumb.addEventListener("pointerdown", (event) => {
+                    event.preventDefault();
+                    scrollDragStartY = event.clientY;
+                    const transform = new DOMMatrixReadOnly(getComputedStyle(scrollThumb).transform);
+                    scrollDragStartTop = transform.m42;
+                    scrollThumb.setPointerCapture(event.pointerId);
+                });
+
+                scrollThumb.addEventListener("pointermove", (event) => {
+                    if (!scrollThumb.hasPointerCapture(event.pointerId)) return;
+                    event.preventDefault();
+                    const maxThumbTop = Math.max(0, scrollTrack.clientHeight - scrollThumb.offsetHeight);
+                    const nextTop = Math.max(0, Math.min(maxThumbTop, scrollDragStartTop + event.clientY - scrollDragStartY));
+                    const maxScroll = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+                    window.scrollTo(0, maxThumbTop ? (nextTop / maxThumbTop) * maxScroll : 0);
+                });
+
+                scrollTrack.addEventListener("pointerdown", (event) => {
+                    if (event.target === scrollThumb) return;
+                    const rect = scrollTrack.getBoundingClientRect();
+                    const ratio = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+                    const maxScroll = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+                    window.scrollTo({ top: ratio * maxScroll, behavior: "smooth" });
+                });
+            }
+
+            const stopOrderCamera = () => {
+                if (cameraCountdownTimer) {
+                    window.clearInterval(cameraCountdownTimer);
+                    cameraCountdownTimer = null;
+                }
+                if (cameraStream) {
+                    cameraStream.getTracks().forEach((track) => track.stop());
+                    cameraStream = null;
+                }
+                if (cameraVideo) cameraVideo.srcObject = null;
+                cameraCountdown?.classList.add("is-hidden");
+                if (cameraCaptureButton) cameraCaptureButton.disabled = false;
+            };
+
+            const closeOrderCamera = () => {
+                stopOrderCamera();
+                cameraModal?.classList.remove("visible");
+                cameraModal?.setAttribute("aria-hidden", "true");
+            };
+
+            const openOrderCamera = async () => {
+                if (!cameraModal || !cameraVideo || !cameraStatus || !cameraCaptureButton) return;
+                hideKeyboard();
+                cameraModal.classList.add("visible");
+                cameraModal.setAttribute("aria-hidden", "false");
+                cameraStatus.textContent = "Đang kết nối camera USB...";
+                cameraCaptureButton.disabled = true;
+
+                try {
+                    if (!navigator.mediaDevices?.getUserMedia) {
+                        throw new Error("Trình duyệt không hỗ trợ truy cập camera.");
+                    }
+                    cameraStream = await navigator.mediaDevices.getUserMedia({
+                        video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+                        audio: false,
+                    });
+                    cameraVideo.srcObject = cameraStream;
+                    await cameraVideo.play();
+                    cameraStatus.textContent = "Camera đã sẵn sàng. Nhấn nút bên dưới để chụp sau 5 giây.";
+                    cameraCaptureButton.disabled = false;
+                } catch (error) {
+                    cameraStatus.textContent = `Không mở được camera: ${error?.message || "hãy kiểm tra kết nối và quyền camera."}`;
+                }
+            };
+
+            const captureOrderPhoto = () => {
+                if (!cameraVideo || !cameraPhotoData || !cameraPreview || !cameraPreviewImage) return;
+                const sourceWidth = cameraVideo.videoWidth;
+                const sourceHeight = cameraVideo.videoHeight;
+                if (!sourceWidth || !sourceHeight) {
+                    if (cameraStatus) cameraStatus.textContent = "Camera chưa có hình ảnh. Vui lòng thử lại.";
+                    if (cameraCaptureButton) cameraCaptureButton.disabled = false;
+                    return;
+                }
+
+                const scale = Math.min(1, 1280 / sourceWidth);
+                const canvas = document.createElement("canvas");
+                canvas.width = Math.round(sourceWidth * scale);
+                canvas.height = Math.round(sourceHeight * scale);
+                canvas.getContext("2d").drawImage(cameraVideo, 0, 0, canvas.width, canvas.height);
+                const photoData = canvas.toDataURL("image/jpeg", 0.86);
+                cameraPhotoData.value = photoData;
+                cameraPreviewImage.src = photoData;
+                cameraPreview.classList.remove("is-hidden");
+                if (cameraOpenButton) cameraOpenButton.textContent = "📷 Chụp lại ảnh đơn hàng";
+                closeOrderCamera();
+            };
+
+            cameraOpenButton?.addEventListener("click", openOrderCamera);
+            document.querySelectorAll("[data-close-order-camera]").forEach((button) => {
+                button.addEventListener("click", closeOrderCamera);
+            });
+            cameraCaptureButton?.addEventListener("click", () => {
+                if (!cameraStream || cameraCountdownTimer || !cameraCountdown) return;
+                let secondsLeft = 5;
+                cameraCaptureButton.disabled = true;
+                cameraCountdown.textContent = String(secondsLeft);
+                cameraCountdown.classList.remove("is-hidden");
+                if (cameraStatus) cameraStatus.textContent = "Giữ đơn hàng trước camera...";
+                cameraCountdownTimer = window.setInterval(() => {
+                    secondsLeft -= 1;
+                    cameraCountdown.textContent = String(Math.max(0, secondsLeft));
+                    if (secondsLeft <= 0) {
+                        window.clearInterval(cameraCountdownTimer);
+                        cameraCountdownTimer = null;
+                        captureOrderPhoto();
+                    }
+                }, 1000);
+            });
+            document.querySelector("[data-remove-order-photo]")?.addEventListener("click", () => {
+                if (cameraPhotoData) cameraPhotoData.value = "";
+                if (cameraPreviewImage) cameraPreviewImage.removeAttribute("src");
+                cameraPreview?.classList.add("is-hidden");
+                if (cameraOpenButton) cameraOpenButton.textContent = "📷 Chụp đơn hàng";
+            });
+            window.addEventListener("beforeunload", stopOrderCamera);
 
             const showKeyboard = () => {
                 if (!keyboard) return;
@@ -1615,6 +1941,37 @@ def page_template(
                 field.addEventListener("focus", () => setActive(field));
             });
 
+            // Most USB/Bluetooth barcode and QR scanners act like a keyboard:
+            // they type the decoded value quickly and finish with Enter or Tab.
+            // Kiosk inputs remain readonly to suppress the system keyboard, so
+            // collect that key stream here and place it in the scanner field.
+            document.addEventListener("keydown", (event) => {
+                if (!scannerTarget || event.ctrlKey || event.metaKey || event.altKey) return;
+
+                const now = performance.now();
+                if (event.key === "Enter" || event.key === "Tab") {
+                    if (scannerBuffer.length >= 2) {
+                        event.preventDefault();
+                        scannerTarget.value = scannerBuffer.trim();
+                        scannerTarget.dispatchEvent(new Event("input", { bubbles: true }));
+                        scannerTarget.dispatchEvent(new Event("change", { bubbles: true }));
+                        scannerTarget.classList.add("scanner-filled");
+                        window.setTimeout(() => scannerTarget.classList.remove("scanner-filled"), 900);
+                    }
+                    scannerBuffer = "";
+                    scannerLastKeyAt = 0;
+                    return;
+                }
+
+                if (event.key.length === 1) {
+                    if (scannerLastKeyAt && now - scannerLastKeyAt > scannerMaxKeyGapMs) {
+                        scannerBuffer = "";
+                    }
+                    scannerBuffer += event.key;
+                    scannerLastKeyAt = now;
+                }
+            });
+
             if (keyboard) {
                 keyboard.addEventListener("pointerdown", (event) => {
                     event.stopPropagation();
@@ -1676,11 +2033,15 @@ def page_template(
             document.addEventListener("pointerdown", (event) => {
                 const target = event.target;
                 if (!(target instanceof Element)) return;
-                if (target.closest(".keyboard-shell") || target.closest("[data-touch-input='true']") || target.closest(".result-modal")) return;
+                if (target.closest(".keyboard-shell") || target.closest("[data-touch-input='true']") || target.closest(".result-modal") || target.closest("[data-scroll-control]")) return;
                 hideKeyboard();
             });
 
-            window.addEventListener("resize", updateKeyboardSpace);
+            window.addEventListener("scroll", updateScrollControl, { passive: true });
+            window.addEventListener("resize", () => {
+                updateKeyboardSpace();
+                updateScrollControl();
+            });
             if (window.visualViewport) {
                 window.visualViewport.addEventListener("resize", updateKeyboardSpace);
             }
@@ -1689,6 +2050,8 @@ def page_template(
             window.setInterval(updateLiveTime, 1000);
             updateLetterKeys();
             updateKeyboardSpace();
+            updateScrollControl();
+            window.requestAnimationFrame(updateScrollControl);
 
 """ + ("""
             const refreshAdminCommand = async () => {
@@ -1758,6 +2121,11 @@ def page_template(
             html {{
                 scroll-behavior: smooth;
                 touch-action: pan-y;
+                scrollbar-width: none;
+            }}
+
+            html::-webkit-scrollbar {{
+                display: none;
             }}
 
             body {{
@@ -1771,6 +2139,75 @@ def page_template(
                 min-height: 100dvh;
                 overflow-x: hidden;
                 touch-action: pan-y;
+                padding-right: 72px;
+            }}
+
+            .kiosk-scroll-control {{
+                position: fixed;
+                z-index: 90;
+                top: 18px;
+                right: 8px;
+                bottom: 18px;
+                width: 58px;
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+                padding: 6px;
+                border: 2px solid rgba(11, 79, 174, 0.2);
+                border-radius: 24px;
+                background: rgba(255, 255, 255, 0.96);
+                box-shadow: 0 12px 30px rgba(10, 67, 138, 0.18);
+                touch-action: none;
+            }}
+
+            .kiosk-scroll-control.is-hidden {{
+                display: none;
+            }}
+
+            .kiosk-scroll-button {{
+                flex: 0 0 48px;
+                width: 100%;
+                border: 0;
+                border-radius: 16px;
+                background: #0b4fae;
+                color: #ffffff;
+                font-size: 1.45rem;
+                font-weight: 900;
+                line-height: 1;
+                cursor: pointer;
+                touch-action: manipulation;
+            }}
+
+            .kiosk-scroll-button:active {{
+                background: #073b82;
+                transform: scale(0.96);
+            }}
+
+            .kiosk-scroll-track {{
+                position: relative;
+                flex: 1 1 auto;
+                min-height: 120px;
+                border-radius: 18px;
+                background: #dbeaff;
+                overflow: hidden;
+                touch-action: none;
+            }}
+
+            .kiosk-scroll-thumb {{
+                position: absolute;
+                top: 0;
+                left: 4px;
+                right: 4px;
+                min-height: 72px;
+                border-radius: 14px;
+                background: linear-gradient(180deg, #2e87ef, #0b4fae);
+                box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.32);
+                cursor: grab;
+                touch-action: none;
+            }}
+
+            .kiosk-scroll-thumb:active {{
+                cursor: grabbing;
             }}
 
             .page {{
@@ -2325,6 +2762,155 @@ def page_template(
                 gap: 12px;
             }}
 
+            .is-hidden {{
+                display: none !important;
+            }}
+
+            .order-camera-field {{
+                display: grid;
+                gap: 10px;
+            }}
+
+            .order-camera-label {{
+                font-size: 0.96rem;
+                font-weight: 700;
+            }}
+
+            .order-camera-open {{
+                width: 100%;
+                min-height: 68px;
+                border: 2px dashed rgba(11, 79, 174, 0.42);
+                border-radius: 18px;
+                background: #eef6ff;
+                color: #0b4fae;
+                font-size: 1.15rem;
+                font-weight: 800;
+                cursor: pointer;
+            }}
+
+            .order-camera-preview {{
+                display: grid;
+                grid-template-columns: minmax(160px, 240px) 1fr;
+                align-items: center;
+                gap: 16px;
+                padding: 12px;
+                border: 2px solid rgba(21, 148, 71, 0.24);
+                border-radius: 18px;
+                background: #effcf3;
+                color: #126b36;
+            }}
+
+            .order-camera-preview img {{
+                width: 100%;
+                max-height: 150px;
+                border-radius: 12px;
+                object-fit: cover;
+                background: #dbeaff;
+            }}
+
+            .order-camera-preview strong {{
+                display: block;
+                margin-bottom: 10px;
+            }}
+
+            .order-camera-preview button {{
+                min-height: 44px;
+                padding: 8px 16px;
+                border: 0;
+                border-radius: 12px;
+                background: #dff5e7;
+                color: #126b36;
+                font-weight: 800;
+            }}
+
+            .order-camera-backdrop {{
+                position: fixed;
+                inset: 0;
+                z-index: 150;
+                display: none;
+                align-items: center;
+                justify-content: center;
+                padding: 22px;
+                background: rgba(3, 24, 57, 0.82);
+            }}
+
+            .order-camera-backdrop.visible {{
+                display: flex;
+            }}
+
+            .order-camera-dialog {{
+                width: min(920px, 100%);
+                max-height: calc(100vh - 28px);
+                overflow-y: auto;
+                padding: 20px;
+                border-radius: 26px;
+                background: #ffffff;
+                box-shadow: 0 24px 60px rgba(0, 0, 0, 0.36);
+            }}
+
+            .order-camera-head {{
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 16px;
+                margin-bottom: 14px;
+            }}
+
+            .order-camera-head h3 {{
+                margin: 0;
+                font-size: 1.55rem;
+            }}
+
+            .order-camera-head button {{
+                width: 52px;
+                height: 52px;
+                border: 0;
+                border-radius: 50%;
+                background: #dcebff;
+                color: #0b4fae;
+                font-size: 1.8rem;
+            }}
+
+            .order-camera-view {{
+                position: relative;
+                overflow: hidden;
+                min-height: 360px;
+                border-radius: 20px;
+                background: #071529;
+            }}
+
+            .order-camera-view video {{
+                display: block;
+                width: 100%;
+                height: min(58vh, 540px);
+                object-fit: contain;
+            }}
+
+            .order-camera-countdown {{
+                position: absolute;
+                inset: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: #ffffff;
+                background: rgba(3, 24, 57, 0.3);
+                font-size: clamp(7rem, 24vw, 14rem);
+                font-weight: 900;
+                text-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+            }}
+
+            .order-camera-dialog > p {{
+                margin: 14px 0;
+                text-align: center;
+                font-weight: 700;
+            }}
+
+            .order-camera-actions {{
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 12px;
+            }}
+
             label {{
                 display: block;
                 font-size: 0.96rem;
@@ -2349,6 +2935,11 @@ def page_template(
             input.active-input {{
                 border-color: var(--accent);
                 box-shadow: 0 0 0 4px rgba(11, 79, 174, 0.12);
+            }}
+
+            input.scanner-filled {{
+                border-color: #159447;
+                box-shadow: 0 0 0 4px rgba(21, 148, 71, 0.16);
             }}
 
             .submit-button {{
@@ -2457,6 +3048,10 @@ def page_template(
                 grid-template-columns: repeat(2, minmax(0, 1fr));
                 gap: 14px;
                 margin-bottom: 18px;
+            }}
+
+            .result-highlight-grid.stacked {{
+                grid-template-columns: minmax(0, 1fr);
             }}
 
             .result-highlight-card {{
@@ -2788,8 +3383,8 @@ def page_template(
             }}
 
             .keyboard-grid-numeric .key {{
-                min-height: 74px;
-                font-size: 1.45rem;
+                min-height: 84px;
+                font-size: 1.9rem;
                 border-radius: 18px;
                 box-shadow: inset 0 -2px 0 rgba(11, 79, 174, 0.08);
             }}
@@ -2803,12 +3398,17 @@ def page_template(
             .key {{
                 border: 0;
                 border-radius: 16px;
-                min-height: 56px;
-                font-size: 1.08rem;
-                font-weight: 700;
+                min-height: 66px;
+                font-size: 1.42rem;
+                font-weight: 800;
                 background: #ffffff;
                 color: #0b4fae;
                 cursor: pointer;
+            }}
+
+            .key.backspace-key {{
+                font-size: 1rem;
+                line-height: 1.15;
             }}
 
             .key.wide {{
@@ -2991,7 +3591,7 @@ def page_template(
                 }}
 
                 .keyboard-shell {{
-                    max-height: min(360px, calc(100vh - 20px));
+                    max-height: min(470px, calc(100vh - 20px));
                     padding: 10px 12px calc(12px + env(safe-area-inset-bottom, 0px));
                 }}
 
@@ -3004,14 +3604,14 @@ def page_template(
                 }}
 
                 .key {{
-                    min-height: 48px;
-                    font-size: 1rem;
+                    min-height: 64px;
+                    font-size: 1.35rem;
                     border-radius: 12px;
                 }}
 
                 .keyboard-grid-numeric .key {{
-                    min-height: 64px;
-                    font-size: 1.28rem;
+                    min-height: 82px;
+                    font-size: 1.8rem;
                     border-radius: 16px;
                 }}
 
@@ -3276,6 +3876,13 @@ def page_template(
             </section>
             {content}
         </main>
+        <nav class="kiosk-scroll-control is-hidden" data-scroll-control aria-label="Điều khiển cuộn trang">
+            <button class="kiosk-scroll-button" type="button" data-scroll-up aria-label="Cuộn lên">▲</button>
+            <div class="kiosk-scroll-track" data-scroll-track>
+                <div class="kiosk-scroll-thumb" data-scroll-thumb role="scrollbar" aria-label="Kéo để cuộn trang"></div>
+            </div>
+            <button class="kiosk-scroll-button" type="button" data-scroll-down aria-label="Cuộn xuống">▼</button>
+        </nav>
         <div data-admin-alert-host>{admin_modal_html}</div>
         {keyboard}
         {page_script}
@@ -3407,6 +4014,7 @@ def flow_page(
     fields: list[tuple[str, str, str, str, str]],
     submit_label: str,
     result_html: str = "",
+    enable_order_camera: bool = False,
 ) -> str:
     form_fields = "".join(
         f"""
@@ -3421,12 +4029,46 @@ def flow_page(
                 readonly
                 data-touch-input="true"
                 data-keyboard-mode="{keyboard_mode}"
+                {'data-scanner-input="true"' if field_name in {'order_code', 'pickup_code'} else ''}
                 required
             >
         </div>
         """
         for field_id, field_name, label, placeholder, keyboard_mode in fields
     )
+    camera_html = """
+        <section class="order-camera-field">
+            <span class="order-camera-label">Ảnh đơn hàng</span>
+            <input type="hidden" name="order_photo_data" data-order-photo-data>
+            <button class="order-camera-open" type="button" data-open-order-camera>
+                📷 Chụp đơn hàng
+            </button>
+            <div class="order-camera-preview is-hidden" data-order-camera-preview>
+                <img alt="Ảnh đơn hàng vừa chụp" data-order-camera-preview-image>
+                <div>
+                    <strong>Đã chụp ảnh đơn hàng</strong>
+                    <button type="button" data-remove-order-photo>Xóa ảnh</button>
+                </div>
+            </div>
+        </section>
+        <div class="order-camera-backdrop" data-order-camera-modal aria-hidden="true">
+            <section class="order-camera-dialog" role="dialog" aria-modal="true" aria-label="Chụp ảnh đơn hàng">
+                <div class="order-camera-head">
+                    <h3>Chụp ảnh đơn hàng</h3>
+                    <button type="button" data-close-order-camera aria-label="Đóng camera">×</button>
+                </div>
+                <div class="order-camera-view">
+                    <video data-order-camera-video autoplay playsinline muted></video>
+                    <div class="order-camera-countdown is-hidden" data-order-camera-countdown></div>
+                </div>
+                <p data-order-camera-status>Nhấn “Bắt đầu chụp” để đếm ngược 5 giây.</p>
+                <div class="order-camera-actions">
+                    <button class="submit-button secondary" type="button" data-close-order-camera>Hủy</button>
+                    <button class="submit-button" type="button" data-capture-order-photo>Bắt đầu chụp (5 giây)</button>
+                </div>
+            </section>
+        </div>
+    """ if enable_order_camera else ""
 
     return page_template(
         title,
@@ -3444,6 +4086,7 @@ def flow_page(
                 <h2>Nhập thông tin</h2>
                 <form method="post" action="{escape(action)}" class="form-grid">
                     {form_fields}
+                    {camera_html}
                     <button class="submit-button" type="submit">{escape(submit_label)}</button>
                 </form>
                 {result_html}
@@ -4026,12 +4669,18 @@ async def shipper_dropoff_form() -> HTMLResponse:
                 ("order_code", "order_code", "Mã đơn hàng", "Quét hoặc nhập mã đơn hàng", "full"),
             ],
             submit_label="Lưu hàng vào tủ",
+            enable_order_camera=True,
         )
     )
 
 
 @app.post("/giao-do", response_class=HTMLResponse)
-async def shipper_dropoff(request: Request, phone: str = Form(...), order_code: str = Form(...)) -> HTMLResponse:
+async def shipper_dropoff(
+    request: Request,
+    phone: str = Form(...),
+    order_code: str = Form(...),
+    order_photo_data: str = Form(""),
+) -> HTMLResponse:
     try:
         cleaned_phone = normalize_phone(phone)
         recipient = get_registered_user(cleaned_phone)
@@ -4043,15 +4692,41 @@ async def shipper_dropoff(request: Request, phone: str = Form(...), order_code: 
             email_delivery_status="pending" if recipient is not None else "unregistered",
             email_delivery_note="Đã tìm thấy email đăng ký." if recipient is not None else "Số điện thoại chưa đăng ký email.",
         )
+        try:
+            open_locker(record.locker_id)
+            mark_locker_used(record.locker_id)
+        except LockerHardwareError as exc:
+            release_record(record)
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        photo_path: Path | None = None
+        photo_note = "Đơn hàng chưa có ảnh chụp."
+        if order_photo_data.strip():
+            try:
+                photo_path = save_order_photo(
+                    order_photo_data,
+                    record.order_code or order_code,
+                    record.locker_id,
+                    record.pickup_code,
+                )
+                if photo_path is not None:
+                    photo_note = f"Đã lưu ảnh đơn hàng: {photo_path.name}"
+            except (OrderPhotoError, OSError) as exc:
+                photo_note = f"Đơn đã lưu nhưng ảnh chụp chưa lưu được: {exc}"
         token_note = "Người nhận chưa đăng ký email nên hiện chỉ có mã dự phòng tại kiosk."
         if recipient is not None:
-            record, token_note = queue_pickup_email_delivery(record, recipient.email, request)
+            record, token_note = queue_pickup_email_delivery(
+                record,
+                recipient.email,
+                request,
+                order_photo_path=photo_path,
+            )
         result_html = result_panel(
             "Đã lưu hàng vào tủ",
             [
                 f"Vị trí tủ đã mở: Tủ {record.locker_id}",
                 f"Mã mở tủ tại kiosk: {record.pickup_code}",
                 f"Mã đơn hàng: {record.order_code or '---'}",
+                photo_note,
                 token_note,
             ],
             highlights=[
@@ -4060,8 +4735,8 @@ async def shipper_dropoff(request: Request, phone: str = Form(...), order_code: 
             ],
             redirect_url="/",
         )
-    except HTTPException as exc:
-        result_html = result_panel("Không thể lưu hàng", [exc.detail], tone="error", redirect_url="/")
+    except (HTTPException, LockerHardwareError) as exc:
+        result_html = result_panel("Không thể lưu hàng", [user_error_message(exc)], tone="error", redirect_url="/")
     except OSError as exc:
         if 'record' in locals() and recipient is not None:
             record = update_record_email_delivery(record, recipient.email, "failed", str(exc))
@@ -4092,6 +4767,7 @@ async def shipper_dropoff(request: Request, phone: str = Form(...), order_code: 
             ],
             submit_label="Lưu hàng vào tủ",
             result_html=result_html,
+            enable_order_camera=True,
         )
     )
 
@@ -4101,11 +4777,11 @@ async def receiver_form() -> HTMLResponse:
     return HTMLResponse(
         flow_page(
             title="Nhận hàng",
-            subtitle="Người nhận nhập số điện thoại và mã mở tủ 6 số để lấy hàng.",
+            subtitle="Người nhận nhập số điện thoại và nhập hoặc quét QR mã mở tủ 6 số để lấy hàng.",
             action="/nhan-do",
             fields=[
                 ("phone", "phone", "Số điện thoại", "Nhập số điện thoại người nhận", "numeric"),
-                ("pickup_code", "pickup_code", "Mã mở tủ", "Nhập mã mở tủ 6 số", "numeric"),
+                ("pickup_code", "pickup_code", "Mã mở tủ", "Quét QR hoặc nhập mã mở tủ 6 số", "numeric"),
             ],
             submit_label="Mở tủ để nhận hàng",
         )
@@ -4117,7 +4793,11 @@ async def receiver_pickup(phone: str = Form(...), pickup_code: str = Form(...)) 
     try:
         cleaned_phone = normalize_phone(phone)
         enforce_rate_limit(f"pickup-code:{cleaned_phone}")
-        record = collect_record(cleaned_phone, normalize_required(pickup_code, "Mã mở tủ"))
+        cleaned_code = normalize_required(pickup_code, "Mã mở tủ")
+        preview_record = get_record_by_phone_pickup(cleaned_phone, cleaned_code)
+        open_locker(preview_record.locker_id)
+        record = collect_record(cleaned_phone, cleaned_code)
+        mark_locker_empty(record.locker_id)
         result_html = result_panel(
             "Mở tủ thành công",
             [
@@ -4131,17 +4811,17 @@ async def receiver_pickup(phone: str = Form(...), pickup_code: str = Form(...)) 
             ],
             redirect_url="/",
         )
-    except HTTPException as exc:
-        result_html = result_panel("Không thể mở tủ", [exc.detail], tone="error")
+    except (HTTPException, LockerHardwareError) as exc:
+        result_html = result_panel("Không thể mở tủ", [user_error_message(exc)], tone="error")
 
     return HTMLResponse(
         flow_page(
             title="Nhận hàng",
-            subtitle="Người nhận nhập số điện thoại và mã mở tủ 6 số để lấy hàng.",
+            subtitle="Người nhận nhập số điện thoại và nhập hoặc quét QR mã mở tủ 6 số để lấy hàng.",
             action="/nhan-do",
             fields=[
                 ("phone", "phone", "Số điện thoại", "Nhập số điện thoại người nhận", "numeric"),
-                ("pickup_code", "pickup_code", "Mã mở tủ", "Nhập mã mở tủ 6 số", "numeric"),
+                ("pickup_code", "pickup_code", "Mã mở tủ", "Quét QR hoặc nhập mã mở tủ 6 số", "numeric"),
             ],
             submit_label="Mở tủ để nhận hàng",
             result_html=result_html,
@@ -4260,7 +4940,9 @@ async def pickup_code_open(pickup_code: str, phone_last4: str = Form(...)) -> HT
     try:
         enforce_rate_limit(f"pickup-code-link:{cleaned_code}")
         preview_record = get_record_by_pickup_code(cleaned_code)
+        open_locker(preview_record.locker_id)
         record = collect_record_by_last4(cleaned_code, normalize_phone_last4(phone_last4))
+        mark_locker_empty(record.locker_id)
         result_html = result_panel(
             "Mở tủ thành công",
             [
@@ -4275,13 +4957,13 @@ async def pickup_code_open(pickup_code: str, phone_last4: str = Form(...)) -> HT
             redirect_url="/",
         )
         return HTMLResponse(pickup_code_page(cleaned_code, preview_record.locker_id, result_html))
-    except HTTPException as exc:
+    except (HTTPException, LockerHardwareError) as exc:
         try:
             preview_record = get_record_by_pickup_code(cleaned_code)
             page = pickup_code_page(
                 cleaned_code,
                 preview_record.locker_id,
-                result_panel("Không thể mở tủ", [exc.detail], tone="error"),
+                result_panel("Không thể mở tủ", [user_error_message(exc)], tone="error"),
             )
         except HTTPException:
             page = page_template(
@@ -4295,7 +4977,7 @@ async def pickup_code_open(pickup_code: str, phone_last4: str = Form(...)) -> HT
                     <a class="home-link" href="/">Trang chủ</a>
                 </section>
                 <section class="panel">
-                    {result_panel("Không thể mở mã", [exc.detail], tone="error")}
+                    {result_panel("Không thể mở mã", [user_error_message(exc)], tone="error")}
                 </section>
                 """,
             )
@@ -4308,7 +4990,9 @@ async def pickup_link_open(request: Request, raw_token: str, phone_last4: str = 
     try:
         enforce_rate_limit(f"pickup-link:{hash_token(raw_token)}")
         preview_record, preview_token = resolve_pickup_access(raw_token)
+        open_locker(preview_record.locker_id)
         record = mark_pickup_access_used(raw_token, normalize_phone_last4(phone_last4))
+        mark_locker_empty(record.locker_id)
         result_html = result_panel(
             "Mở tủ thành công",
             [
@@ -4332,7 +5016,7 @@ async def pickup_link_open(request: Request, raw_token: str, phone_last4: str = 
                 timeout_seconds=timeout_seconds,
             )
         )
-    except HTTPException as exc:
+    except (HTTPException, LockerHardwareError) as exc:
         try:
             preview_record, preview_token = resolve_pickup_access(raw_token)
             page = pickup_link_page(
@@ -4340,7 +5024,7 @@ async def pickup_link_open(request: Request, raw_token: str, phone_last4: str = 
                 preview_record.locker_id,
                 mask_email(preview_token.email if isinstance(preview_token, AccessTokenRecord) else preview_token.email),
                 preview_token.expires_at,
-                result_panel("Không thể mở tủ", [exc.detail], tone="error"),
+                result_panel("Không thể mở tủ", [user_error_message(exc)], tone="error"),
                 timeout_seconds=timeout_seconds,
             )
         except HTTPException:
@@ -4355,7 +5039,7 @@ async def pickup_link_open(request: Request, raw_token: str, phone_last4: str = 
                     <a class="home-link" href="/">Trang chủ</a>
                 </section>
                 <section class="panel">
-                    {result_panel("Không thể mở link", [exc.detail], tone="error")}
+                    {result_panel("Không thể mở link", [user_error_message(exc)], tone="error")}
                 </section>
                 """,
             )
@@ -4397,6 +5081,7 @@ async def kiosk_user_portal_submit(
                 ("Số điện thoại", cleaned_phone),
                 ("Email", cleaned_email),
             ],
+            stacked_highlights=True,
         )
         return HTMLResponse(kiosk_user_portal_page(result_html, cleaned_phone, cleaned_email, orders))
     except HTTPException as exc:

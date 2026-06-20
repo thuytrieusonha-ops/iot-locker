@@ -9,6 +9,7 @@ __pycache__/
 *.py[cod]
 
 .kiosk_state.json
+order_photos/
 
 .pytest_cache/
 .mypy_cache/

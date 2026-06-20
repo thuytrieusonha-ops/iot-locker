@@ -1324,7 +1324,7 @@ def user_lookup_page(
     </section>
     <section class="panel">
         {result_html}
-        <form method="post" class="form-grid">
+        <form method="post" class="form-grid single">
             <label>
                 <span>Số điện thoại</span>
                 <input name="phone" placeholder="Nhập số điện thoại" autocomplete="tel" required value="{escape(phone)}">

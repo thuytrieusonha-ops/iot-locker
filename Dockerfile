@@ -16,8 +16,10 @@ RUN pip install --upgrade pip \
     && pip install \
         cryptography>=47.0.0 \
         fastapi>=0.136.0 \
+        paho-mqtt>=2.1.0 \
         pillow>=11.2.1 \
         pymysql>=1.1.2 \
+        pyserial>=3.5 \
         python-multipart>=0.0.20 \
         qrcode>=8.2 \
         sqlalchemy>=2.0.49 \

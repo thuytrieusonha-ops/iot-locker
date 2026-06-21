@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -45,6 +46,7 @@ class MqttSettings:
     keepalive: int
     connect_timeout: float
     command_timeout: float
+    door_close_timeout: float
     use_tls: bool
 
 
@@ -58,6 +60,10 @@ class MqttLockerController:
         self._connected = threading.Event()
         self._pending_lock = threading.Lock()
         self._pending: dict[str, tuple[threading.Event, dict[str, Any]]] = {}
+        self._door_condition = threading.Condition()
+        self._door_event_sequence = 0
+        self._door_open_sequence: dict[int, int] = {}
+        self._door_closed_sequence: dict[int, int] = {}
 
     def start(self) -> None:
         with self._client_lock:
@@ -108,6 +114,32 @@ class MqttLockerController:
 
     def mark_locker_empty(self, locker_id: int) -> None:
         self._publish(locker_id, "set_occupied", occupied=False)
+
+    def open_locker_for_dropoff(self, locker_id: int) -> None:
+        """Open a locker, then turn on its occupied light only after the door closes."""
+        self._validate_locker_id(locker_id)
+        with self._door_condition:
+            event_marker = self._door_event_sequence
+
+        self.open_locker(locker_id)
+        self._wait_for_open_then_close(locker_id, event_marker)
+        self.mark_locker_used(locker_id)
+
+    def _wait_for_open_then_close(self, locker_id: int, event_marker: int) -> None:
+        deadline = time.monotonic() + self.settings.door_close_timeout
+        with self._door_condition:
+            while True:
+                opened_at = self._door_open_sequence.get(locker_id, 0)
+                closed_at = self._door_closed_sequence.get(locker_id, 0)
+                if opened_at > event_marker and closed_at > opened_at:
+                    return
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise LockerHardwareError(
+                        f"Hết thời gian chờ shipper đóng cửa tủ {locker_id}. Đèn chưa được bật."
+                    )
+                self._door_condition.wait(remaining)
 
     def _create_and_connect_client(self) -> None:
         try:
@@ -160,7 +192,7 @@ class MqttLockerController:
             raise LockerHardwareError(f"Không publish được lệnh MQTT (mã lỗi {result.rc}).")
 
     def _on_connect(self, client: Any, userdata: Any, flags: Any, reason_code: Any, properties: Any) -> None:
-        if int(reason_code) != 0:
+        if reason_code != 0:
             print(f"[smartlocker] MQTT connection rejected: {reason_code}")
             return
         prefix = self.settings.topic_prefix
@@ -178,7 +210,7 @@ class MqttLockerController:
         properties: Any,
     ) -> None:
         self._connected.clear()
-        if int(reason_code) != 0:
+        if reason_code != 0:
             print(f"[smartlocker] MQTT disconnected unexpectedly: {reason_code}")
 
     def _on_message(self, client: Any, userdata: Any, message: Any) -> None:
@@ -197,6 +229,23 @@ class MqttLockerController:
                     response.update(payload)
                     done.set()
             return
+
+        if message.topic.endswith("/event"):
+            try:
+                locker_id = int(payload["locker_id"])
+                event_name = str(payload["event"])
+            except (KeyError, TypeError, ValueError):
+                print(f"[smartlocker] Ignored invalid MQTT event on {message.topic}.")
+                return
+
+            if event_name in {"door_open", "door_closed"}:
+                with self._door_condition:
+                    self._door_event_sequence += 1
+                    if event_name == "door_open":
+                        self._door_open_sequence[locker_id] = self._door_event_sequence
+                    else:
+                        self._door_closed_sequence[locker_id] = self._door_event_sequence
+                    self._door_condition.notify_all()
 
         print(f"[smartlocker] MQTT event {message.topic}: {payload}")
 
@@ -219,6 +268,7 @@ MQTT_SETTINGS = MqttSettings(
     keepalive=max(10, env_int("SMARTLOCKER_MQTT_KEEPALIVE", 60)),
     connect_timeout=max(0.1, env_float("SMARTLOCKER_MQTT_CONNECT_TIMEOUT", 5.0)),
     command_timeout=max(0.1, env_float("SMARTLOCKER_MQTT_COMMAND_TIMEOUT", 5.0)),
+    door_close_timeout=max(1.0, env_float("SMARTLOCKER_DOOR_CLOSE_TIMEOUT", 120.0)),
     use_tls=env_bool("SMARTLOCKER_MQTT_USE_TLS", False),
 )
 controller = MqttLockerController(MQTT_SETTINGS)
@@ -248,6 +298,18 @@ def open_locker(locker_id: int) -> None:
         if HARDWARE_REQUIRED:
             raise
         print(f"[smartlocker] MQTT warning, simulated open for locker {locker_id}: {exc}")
+
+
+def open_locker_for_dropoff(locker_id: int) -> None:
+    if not HARDWARE_ENABLED:
+        print(f"[smartlocker] Hardware disabled, simulated dropoff for locker {locker_id}.")
+        return
+    try:
+        controller.open_locker_for_dropoff(locker_id)
+    except LockerHardwareError as exc:
+        if HARDWARE_REQUIRED:
+            raise
+        print(f"[smartlocker] MQTT warning, simulated dropoff for locker {locker_id}: {exc}")
 
 
 def mark_locker_used(locker_id: int) -> None:

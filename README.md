@@ -292,6 +292,7 @@ SMARTLOCKER_MQTT_TOPIC_PREFIX="smartlocker"
 SMARTLOCKER_MQTT_CLIENT_ID="smartlocker-app"
 SMARTLOCKER_MQTT_QOS="1"
 SMARTLOCKER_MQTT_COMMAND_TIMEOUT="5.0"
+SMARTLOCKER_DOOR_CLOSE_TIMEOUT="120.0"
 SMARTLOCKER_GATEWAY_MQTT_CLIENT_ID="smartlocker-pi-gateway"
 SMARTLOCKER_UART_PORT="/dev/serial0"
 SMARTLOCKER_UART_BAUDRATE="9600"
@@ -325,6 +326,11 @@ Accepted success statuses are `ok`, `opened`, and `accepted`. Occupancy changes 
 ```json
 {"command":"set_occupied","locker_id":1,"occupied":true}
 ```
+
+During shipper dropoff, the app waits for a `door_open` event followed by a
+`door_closed` event for the same locker. Only then does it publish
+`set_occupied=true`, so the occupied light stays off while the door is open.
+`SMARTLOCKER_DOOR_CLOSE_TIMEOUT` controls how long the app waits for that sequence.
 
 ### Raspberry Pi to Arduino Mega UART
 

@@ -1802,6 +1802,8 @@ def admin_dashboard_page(csrf_token: str = "") -> str:
 
             document.querySelectorAll("[data-admin-action]").forEach((button) => {{
                 button.addEventListener("click", async () => {{
+                    if (button.disabled) return;
+                    button.disabled = true;
                     const action = button.getAttribute("data-admin-action");
                     try {{
                         let payload;
@@ -1827,6 +1829,8 @@ def admin_dashboard_page(csrf_token: str = "") -> str:
                         refreshMonitor();
                     }} catch (error) {{
                         setAdminFeedback(error.message || "Thao tác quản trị thất bại.", "error");
+                    }} finally {{
+                        button.disabled = false;
                     }}
                 }});
             }});

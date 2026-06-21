@@ -7,6 +7,7 @@ import os
 import secrets
 import smtplib
 import time
+from asyncio import to_thread
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from email.utils import format_datetime, formataddr, make_msgid, localtime
@@ -18,6 +19,7 @@ from re import fullmatch
 from threading import Lock, Thread
 
 from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy import desc, func, select, update
@@ -30,8 +32,8 @@ from locker_hardware import (
     LockerHardwareError,
     close_hardware,
     mark_locker_empty,
-    mark_locker_used,
     open_locker,
+    open_locker_for_dropoff,
     start_hardware,
 )
 from model import AdminCommand, LockerAccessToken, LockerOrder, UserAccount
@@ -185,6 +187,47 @@ def database_unavailable_page() -> str:
 @app.exception_handler(SQLAlchemyError)
 async def database_error_handler(request: Request, exc: Exception) -> HTMLResponse:
     return HTMLResponse(database_unavailable_page(), status_code=503)
+
+
+@app.exception_handler(RequestValidationError)
+async def form_validation_error_handler(request: Request, exc: RequestValidationError) -> HTMLResponse:
+    field_labels = {
+        "phone": "Số điện thoại",
+        "email": "Email",
+        "order_code": "Mã đơn hàng",
+        "pickup_code": "Mã mở tủ",
+        "phone_last4": "4 số cuối số điện thoại",
+        "issue_type": "Loại sự cố",
+    }
+    missing_fields: list[str] = []
+    for error in exc.errors():
+        location = error.get("loc", ())
+        field_name = str(location[-1]) if location else ""
+        label = field_labels.get(field_name, field_name.replace("_", " ").strip().title())
+        if label and label not in missing_fields:
+            missing_fields.append(label)
+
+    detail = (
+        "Vui lòng nhập đầy đủ: " + ", ".join(missing_fields) + "."
+        if missing_fields
+        else "Vui lòng kiểm tra và nhập đầy đủ các thông tin bắt buộc."
+    )
+    retry_path = request.url.path
+    return HTMLResponse(
+        page_template(
+            "Thiếu thông tin",
+            f"""
+            <section class="panel">
+                <h2>Thông tin chưa đầy đủ</h2>
+                <p>Hãy quay lại biểu mẫu và bổ sung các ô còn thiếu.</p>
+                <a class="nav-link primary" href="{escape(retry_path)}">Quay lại nhập thông tin</a>
+            </section>
+            {result_panel("Chưa thể tiếp tục", [detail], tone="error")}
+            """,
+            enable_admin_command_polling=False,
+        ),
+        status_code=422,
+    )
 
 
 def read_dotenv_value(name: str, filename: str = ".env") -> str:
@@ -1890,6 +1933,90 @@ def page_template(
                     window.location.href = resultRedirectUrl;
                 }
             };
+
+            const fieldLabel = (field) => {
+                const knownLabels = {
+                    phone: "Số điện thoại",
+                    email: "Email",
+                    order_code: "Mã đơn hàng",
+                    pickup_code: "Mã mở tủ",
+                    phone_last4: "4 số cuối số điện thoại",
+                    issue_type: "Loại sự cố",
+                };
+                const explicitLabel = field.id
+                    ? document.querySelector(`label[for="${CSS.escape(field.id)}"]`)?.textContent?.trim()
+                    : "";
+                return explicitLabel || knownLabels[field.name] || field.name || "Thông tin bắt buộc";
+            };
+
+            const showFormValidationModal = (labels, firstField) => {
+                document.querySelector("[data-form-validation-modal]")?.remove();
+                hideKeyboard();
+
+                const backdrop = document.createElement("div");
+                backdrop.className = "result-modal-backdrop";
+                backdrop.dataset.formValidationModal = "true";
+
+                const dialog = document.createElement("section");
+                dialog.className = "result-modal error";
+                dialog.setAttribute("role", "alertdialog");
+                dialog.setAttribute("aria-modal", "true");
+
+                const title = document.createElement("h3");
+                title.textContent = "Chưa nhập đủ thông tin";
+                dialog.appendChild(title);
+
+                const list = document.createElement("ul");
+                const item = document.createElement("li");
+                item.textContent = `Vui lòng nhập: ${labels.join(", ")}.`;
+                list.appendChild(item);
+                dialog.appendChild(list);
+
+                const closeButton = document.createElement("button");
+                closeButton.type = "button";
+                closeButton.className = "result-modal-button";
+                closeButton.textContent = "Quay lại nhập";
+                dialog.appendChild(closeButton);
+                backdrop.appendChild(dialog);
+
+                const close = () => {
+                    backdrop.remove();
+                    if (firstField?.matches("[data-touch-input='true']")) {
+                        setActive(firstField);
+                    } else {
+                        firstField?.focus();
+                    }
+                };
+                closeButton.addEventListener("click", close);
+                backdrop.addEventListener("click", (event) => {
+                    if (event.target === backdrop) close();
+                });
+                document.body.appendChild(backdrop);
+            };
+
+            document.querySelectorAll("form").forEach((form) => {
+                // Keep validation inside the kiosk UI instead of navigating to FastAPI's JSON 422 response.
+                form.noValidate = true;
+                form.addEventListener("submit", (event) => {
+                    const missing = [];
+                    const checkedGroups = new Set();
+                    form.querySelectorAll("[required]").forEach((field) => {
+                        const groupKey = field.type === "radio" ? `radio:${field.name}` : `field:${field.name || field.id}`;
+                        if (checkedGroups.has(groupKey)) return;
+                        checkedGroups.add(groupKey);
+
+                        const isMissing = field.type === "radio"
+                            ? !form.querySelector(`input[type="radio"][name="${CSS.escape(field.name)}"]:checked`)
+                            : !String(field.value || "").trim();
+                        if (isMissing) missing.push(field);
+                    });
+
+                    if (!missing.length) return;
+                    event.preventDefault();
+                    const labels = [...new Set(missing.map(fieldLabel))];
+                    showFormValidationModal(labels, missing[0]);
+                });
+            });
 
             const ensureFieldVisible = (field) => {
                 if (!field) return;
@@ -4693,8 +4820,7 @@ async def shipper_dropoff(
             email_delivery_note="Đã tìm thấy email đăng ký." if recipient is not None else "Số điện thoại chưa đăng ký email.",
         )
         try:
-            open_locker(record.locker_id)
-            mark_locker_used(record.locker_id)
+            await to_thread(open_locker_for_dropoff, record.locker_id)
         except LockerHardwareError as exc:
             release_record(record)
             raise HTTPException(status_code=503, detail=str(exc)) from exc

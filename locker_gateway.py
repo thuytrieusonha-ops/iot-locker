@@ -4,6 +4,7 @@ import json
 import os
 import threading
 import time
+from collections import OrderedDict
 from typing import Any
 
 from locker_hardware import MQTT_SETTINGS, env_float, env_int
@@ -30,6 +31,10 @@ class PiMegaGateway:
         self._pending_locker_id: int | None = None
         self._pending_response: str | None = None
         self._pending_event = threading.Event()
+        self._request_lock = threading.Lock()
+        self._inflight_open_requests: dict[str, tuple[int, threading.Event]] = {}
+        self._completed_open_requests: OrderedDict[str, tuple[int, str, str]] = OrderedDict()
+        self._completed_request_limit = 1024
 
     def run(self) -> None:
         self._open_uart()
@@ -94,7 +99,7 @@ class PiMegaGateway:
         return client
 
     def _on_connect(self, client: Any, userdata: Any, flags: Any, reason_code: Any, properties: Any) -> None:
-        if int(reason_code) != 0:
+        if reason_code != 0:
             print(f"[gateway] MQTT connection rejected: {reason_code}")
             return
         prefix = MQTT_SETTINGS.topic_prefix
@@ -121,12 +126,13 @@ class PiMegaGateway:
 
     def _execute_command(self, locker_id: int, command: str, payload: dict[str, Any]) -> None:
         request_id = str(payload.get("request_id") or "")
+        if command == "open" and request_id:
+            self._execute_open_command(locker_id, request_id)
+            return
+
         try:
             if command == "open":
-                if not request_id:
-                    raise RuntimeError("Lệnh open thiếu request_id")
-                self._open_locker(locker_id)
-                self._publish_ack(locker_id, request_id, "opened")
+                raise RuntimeError("Lệnh open thiếu request_id")
             elif command == "set_occupied":
                 uart_command = "LOCKER_USED" if bool(payload.get("occupied")) else "LOCKER_EMPTY"
                 self._write_uart(f"{uart_command},{locker_id}")
@@ -136,6 +142,89 @@ class PiMegaGateway:
             print(f"[gateway] Command failed for locker {locker_id}: {exc}")
             if request_id:
                 self._publish_ack(locker_id, request_id, "error", str(exc))
+
+    def _execute_open_command(self, locker_id: int, request_id: str) -> None:
+        """Execute each MQTT open request once and replay its acknowledgement on redelivery."""
+        try:
+            owner, event, completed = self._claim_open_request(locker_id, request_id)
+        except RuntimeError as exc:
+            print(f"[gateway] Command rejected for locker {locker_id}: {exc}")
+            self._publish_ack(locker_id, request_id, "error", str(exc))
+            return
+        if completed is not None:
+            status, message = completed
+            self._publish_ack(locker_id, request_id, status, message)
+            return
+
+        if not owner:
+            event.wait(self.command_timeout + 1.0)
+            completed = self._completed_open_request(locker_id, request_id)
+            if completed is not None:
+                status, message = completed
+                self._publish_ack(locker_id, request_id, status, message)
+            return
+
+        status = "opened"
+        message = ""
+        try:
+            self._open_locker(locker_id)
+        except Exception as exc:
+            status = "error"
+            message = str(exc)
+            print(f"[gateway] Command failed for locker {locker_id}: {exc}")
+        finally:
+            self._finish_open_request(locker_id, request_id, status, message, event)
+
+        self._publish_ack(locker_id, request_id, status, message)
+
+    def _claim_open_request(
+        self,
+        locker_id: int,
+        request_id: str,
+    ) -> tuple[bool, threading.Event, tuple[str, str] | None]:
+        with self._request_lock:
+            completed = self._completed_open_requests.get(request_id)
+            if completed is not None:
+                completed_locker_id, status, message = completed
+                if completed_locker_id != locker_id:
+                    raise RuntimeError(f"request_id {request_id} đã được dùng cho tủ khác")
+                self._completed_open_requests.move_to_end(request_id)
+                return False, threading.Event(), (status, message)
+
+            inflight = self._inflight_open_requests.get(request_id)
+            if inflight is not None:
+                inflight_locker_id, event = inflight
+                if inflight_locker_id != locker_id:
+                    raise RuntimeError(f"request_id {request_id} đang được dùng cho tủ khác")
+                return False, event, None
+
+            event = threading.Event()
+            self._inflight_open_requests[request_id] = (locker_id, event)
+            return True, event, None
+
+    def _completed_open_request(self, locker_id: int, request_id: str) -> tuple[str, str] | None:
+        with self._request_lock:
+            completed = self._completed_open_requests.get(request_id)
+            if completed is None or completed[0] != locker_id:
+                return None
+            self._completed_open_requests.move_to_end(request_id)
+            return completed[1], completed[2]
+
+    def _finish_open_request(
+        self,
+        locker_id: int,
+        request_id: str,
+        status: str,
+        message: str,
+        event: threading.Event,
+    ) -> None:
+        with self._request_lock:
+            self._inflight_open_requests.pop(request_id, None)
+            self._completed_open_requests[request_id] = (locker_id, status, message)
+            self._completed_open_requests.move_to_end(request_id)
+            while len(self._completed_open_requests) > self._completed_request_limit:
+                self._completed_open_requests.popitem(last=False)
+            event.set()
 
     def _open_locker(self, locker_id: int) -> None:
         with self._open_command_lock:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import CheckConstraint, Computed, DateTime, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
@@ -58,6 +58,16 @@ class Locker(Base):
 
 class LockerOrder(Base):
     __tablename__ = "locker_orders"
+    __table_args__ = (
+        CheckConstraint("status IN ('stored', 'collected')", name="ck_locker_orders_status"),
+        CheckConstraint("flow IN ('user_dropoff', 'shipper_dropoff')", name="ck_locker_orders_flow"),
+        CheckConstraint(
+            "email_delivery_status IS NULL OR email_delivery_status IN "
+            "('pending', 'sent', 'failed', 'smtp_missing', 'unregistered')",
+            name="ck_locker_orders_email_delivery_status",
+        ),
+        UniqueConstraint("active_locker_slot", name="uq_locker_orders_active_locker_slot"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int | None] = mapped_column(
@@ -81,6 +91,11 @@ class LockerOrder(Base):
     email_link_base_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
     email_sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="stored", index=True)
+    active_locker_slot: Mapped[int | None] = mapped_column(
+        Integer,
+        Computed("CASE WHEN status = 'stored' THEN locker_id ELSE NULL END", persisted=True),
+        nullable=True,
+    )
 
     user: Mapped[UserAccount | None] = relationship(back_populates="orders")
     locker: Mapped[Locker] = relationship(back_populates="orders")
@@ -89,6 +104,11 @@ class LockerOrder(Base):
 
 class LockerAccessToken(Base):
     __tablename__ = "locker_access_tokens"
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'used', 'revoked')", name="ck_locker_access_tokens_status"),
+        CheckConstraint("delivery_channel IN ('email')", name="ck_locker_access_tokens_delivery_channel"),
+        UniqueConstraint("active_order_id", name="uq_locker_access_tokens_active_order_id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     order_id: Mapped[int] = mapped_column(
@@ -109,12 +129,20 @@ class LockerAccessToken(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.now)
     used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    active_order_id: Mapped[int | None] = mapped_column(
+        Integer,
+        Computed("CASE WHEN status = 'active' THEN order_id ELSE NULL END", persisted=True),
+        nullable=True,
+    )
 
     order: Mapped[LockerOrder] = relationship(back_populates="access_tokens")
 
 
 class AdminCommand(Base):
     __tablename__ = "admin_commands"
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'completed')", name="ck_admin_commands_status"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     action: Mapped[str] = mapped_column(String(64), nullable=False, index=True)

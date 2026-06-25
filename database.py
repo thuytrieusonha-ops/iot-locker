@@ -366,6 +366,100 @@ def ensure_schema_updates() -> None:
     seed_default_lockers()
     backfill_user_relationships()
 
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
+
+    statements: list[str] = []
+
+    if "locker_orders" in table_names:
+        locker_order_columns = {column["name"] for column in inspector.get_columns("locker_orders")}
+        locker_order_indexes = {index["name"] for index in inspector.get_indexes("locker_orders")}
+        locker_order_uniques = {
+            item["name"] for item in inspector.get_unique_constraints("locker_orders") if item.get("name")
+        }
+        locker_order_checks = _constraint_names(inspector, "locker_orders", "check")
+
+        if "active_locker_slot" not in locker_order_columns:
+            statements.append(
+                "ALTER TABLE locker_orders "
+                "ADD COLUMN active_locker_slot INT "
+                "GENERATED ALWAYS AS (CASE WHEN status = 'stored' THEN locker_id ELSE NULL END) STORED"
+            )
+        if "uq_locker_orders_active_locker_slot" not in locker_order_indexes | locker_order_uniques:
+            statements.append(
+                "ALTER TABLE locker_orders "
+                "ADD CONSTRAINT uq_locker_orders_active_locker_slot UNIQUE (active_locker_slot)"
+            )
+        if "ck_locker_orders_status" not in locker_order_checks:
+            statements.append(
+                "ALTER TABLE locker_orders "
+                "ADD CONSTRAINT ck_locker_orders_status CHECK (status IN ('stored', 'collected'))"
+            )
+        if "ck_locker_orders_flow" not in locker_order_checks:
+            statements.append(
+                "ALTER TABLE locker_orders "
+                "ADD CONSTRAINT ck_locker_orders_flow CHECK (flow IN ('user_dropoff', 'shipper_dropoff'))"
+            )
+        if "ck_locker_orders_email_delivery_status" not in locker_order_checks:
+            statements.append(
+                "ALTER TABLE locker_orders "
+                "ADD CONSTRAINT ck_locker_orders_email_delivery_status CHECK ("
+                "email_delivery_status IS NULL "
+                "OR email_delivery_status IN ('pending', 'sent', 'failed', 'smtp_missing', 'unregistered')"
+                ")"
+            )
+
+    if "locker_access_tokens" in table_names:
+        locker_token_columns = {column["name"] for column in inspector.get_columns("locker_access_tokens")}
+        locker_token_indexes = {index["name"] for index in inspector.get_indexes("locker_access_tokens")}
+        locker_token_uniques = {
+            item["name"] for item in inspector.get_unique_constraints("locker_access_tokens") if item.get("name")
+        }
+        locker_token_checks = _constraint_names(inspector, "locker_access_tokens", "check")
+        locker_token_fks = _constraint_names(inspector, "locker_access_tokens", "foreign_key")
+
+        if "active_order_id" not in locker_token_columns:
+            statements.append(
+                "ALTER TABLE locker_access_tokens "
+                "ADD COLUMN active_order_id INT "
+                "GENERATED ALWAYS AS (CASE WHEN status = 'active' THEN order_id ELSE NULL END) STORED"
+            )
+        if "uq_locker_access_tokens_active_order_id" not in locker_token_indexes | locker_token_uniques:
+            statements.append(
+                "ALTER TABLE locker_access_tokens "
+                "ADD CONSTRAINT uq_locker_access_tokens_active_order_id UNIQUE (active_order_id)"
+            )
+        if "ck_locker_access_tokens_status" not in locker_token_checks:
+            statements.append(
+                "ALTER TABLE locker_access_tokens "
+                "ADD CONSTRAINT ck_locker_access_tokens_status CHECK (status IN ('active', 'used', 'revoked'))"
+            )
+        if "ck_locker_access_tokens_delivery_channel" not in locker_token_checks:
+            statements.append(
+                "ALTER TABLE locker_access_tokens "
+                "ADD CONSTRAINT ck_locker_access_tokens_delivery_channel CHECK (delivery_channel IN ('email'))"
+            )
+        if not ({"fk_locker_access_tokens_order", "fk_locker_access_tokens_order_id"} & locker_token_fks):
+            statements.append(
+                "DELETE token_table FROM locker_access_tokens AS token_table "
+                "LEFT JOIN locker_orders AS order_table ON order_table.id = token_table.order_id "
+                "WHERE order_table.id IS NULL"
+            )
+
+    if "admin_commands" in table_names:
+        admin_command_checks = _constraint_names(inspector, "admin_commands", "check")
+        if "ck_admin_commands_status" not in admin_command_checks:
+            statements.append(
+                "ALTER TABLE admin_commands "
+                "ADD CONSTRAINT ck_admin_commands_status CHECK (status IN ('pending', 'completed'))"
+            )
+
+    for statement in statements:
+        try:
+            execute_schema_statement(statement)
+        except SQLAlchemyError as exc:
+            print(f"[smartlocker] Schema warning: could not run migration statement: {exc}")
+
     if table_exists("locker_orders"):
         add_foreign_key_if_missing(
             "locker_orders",
@@ -380,11 +474,13 @@ def ensure_schema_updates() -> None:
 
     if table_exists("locker_access_tokens"):
         add_index_if_missing("locker_access_tokens", "ix_locker_access_tokens_order_status", "order_id, status")
-        add_foreign_key_if_missing(
-            "locker_access_tokens",
-            "fk_locker_access_tokens_order",
-            "FOREIGN KEY (order_id) REFERENCES locker_orders(id) ON DELETE CASCADE ON UPDATE CASCADE",
-        )
+        locker_token_fks = foreign_key_names("locker_access_tokens")
+        if not ({"fk_locker_access_tokens_order", "fk_locker_access_tokens_order_id"} & locker_token_fks):
+            add_foreign_key_if_missing(
+                "locker_access_tokens",
+                "fk_locker_access_tokens_order",
+                "FOREIGN KEY (order_id) REFERENCES locker_orders(id) ON DELETE CASCADE ON UPDATE CASCADE",
+            )
         add_foreign_key_if_missing(
             "locker_access_tokens",
             "fk_locker_access_tokens_locker",
@@ -393,6 +489,20 @@ def ensure_schema_updates() -> None:
 
     if table_exists("admin_commands"):
         add_index_if_missing("admin_commands", "ix_admin_commands_status_created_at", "status, created_at")
+
+
+def _constraint_names(inspector: object, table_name: str, kind: str) -> set[str]:
+    try:
+        if kind == "check":
+            values = inspector.get_check_constraints(table_name)
+        elif kind == "foreign_key":
+            values = inspector.get_foreign_keys(table_name)
+        else:
+            return set()
+    except NotImplementedError:
+        return set()
+
+    return {item["name"] for item in values if item.get("name")}
 
 
 def get_db() -> Generator[Session, None, None]:

@@ -83,8 +83,10 @@ CREATE TABLE IF NOT EXISTS locker_orders (
     email_link_base_url VARCHAR(255) NULL,
     email_sent_at DATETIME NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'stored',
+    active_locker_slot INT GENERATED ALWAYS AS (CASE WHEN status = 'stored' THEN locker_id ELSE NULL END) STORED,
     PRIMARY KEY (id),
     UNIQUE KEY uq_locker_orders_pickup_code (pickup_code),
+    UNIQUE KEY uq_locker_orders_active_locker_slot (active_locker_slot),
     KEY ix_locker_orders_user_id (user_id),
     KEY ix_locker_orders_locker_id (locker_id),
     KEY ix_locker_orders_phone (phone),
@@ -102,7 +104,13 @@ CREATE TABLE IF NOT EXISTS locker_orders (
     CONSTRAINT fk_locker_orders_locker
         FOREIGN KEY (locker_id) REFERENCES lockers (id)
         ON DELETE RESTRICT
-        ON UPDATE CASCADE
+        ON UPDATE CASCADE,
+    CONSTRAINT ck_locker_orders_status CHECK (status IN ('stored', 'collected')),
+    CONSTRAINT ck_locker_orders_flow CHECK (flow IN ('user_dropoff', 'shipper_dropoff')),
+    CONSTRAINT ck_locker_orders_email_delivery_status CHECK (
+        email_delivery_status IS NULL
+        OR email_delivery_status IN ('pending', 'sent', 'failed', 'smtp_missing', 'unregistered')
+    )
 );
 
 CREATE TABLE IF NOT EXISTS locker_access_tokens (
@@ -117,8 +125,10 @@ CREATE TABLE IF NOT EXISTS locker_access_tokens (
     expires_at DATETIME NOT NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     used_at DATETIME NULL,
+    active_order_id INT GENERATED ALWAYS AS (CASE WHEN status = 'active' THEN order_id ELSE NULL END) STORED,
     PRIMARY KEY (id),
     UNIQUE KEY uq_locker_access_tokens_token_hash (token_hash),
+    UNIQUE KEY uq_locker_access_tokens_active_order_id (active_order_id),
     KEY ix_locker_access_tokens_order_id (order_id),
     KEY ix_locker_access_tokens_locker_id (locker_id),
     KEY ix_locker_access_tokens_phone (phone),
@@ -133,7 +143,9 @@ CREATE TABLE IF NOT EXISTS locker_access_tokens (
     CONSTRAINT fk_locker_access_tokens_locker
         FOREIGN KEY (locker_id) REFERENCES lockers (id)
         ON DELETE RESTRICT
-        ON UPDATE CASCADE
+        ON UPDATE CASCADE,
+    CONSTRAINT ck_locker_access_tokens_status CHECK (status IN ('active', 'used', 'revoked')),
+    CONSTRAINT ck_locker_access_tokens_delivery_channel CHECK (delivery_channel IN ('email'))
 );
 
 CREATE TABLE IF NOT EXISTS admin_commands (
@@ -147,7 +159,8 @@ CREATE TABLE IF NOT EXISTS admin_commands (
     KEY ix_admin_commands_action (action),
     KEY ix_admin_commands_status (status),
     KEY ix_admin_commands_created_at (created_at),
-    KEY ix_admin_commands_status_created_at (status, created_at)
+    KEY ix_admin_commands_status_created_at (status, created_at),
+    CONSTRAINT ck_admin_commands_status CHECK (status IN ('pending', 'completed'))
 );
 
 CREATE TABLE IF NOT EXISTS admin_command_lockers (

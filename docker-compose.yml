@@ -118,38 +118,6 @@ services:
       retries: 10
       start_period: 20s
 
-  kiosk:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: kiosk
-    container_name: smartlocker-kiosk
-    restart: unless-stopped
-    profiles:
-      - kiosk
-    env_file:
-      - .env.docker
-    environment:
-      <<: *smartlocker-db-env
-      SMARTLOCKER_APP_HOST: 0.0.0.0
-      SMARTLOCKER_APP_PORT: 8000
-      DISPLAY: ${DISPLAY:-:0}
-      QT_QPA_PLATFORM: xcb
-      QTWEBENGINE_DISABLE_SANDBOX: "1"
-      XDG_RUNTIME_DIR: /tmp/runtime-root
-    command: ["python", "kiosk.py"]
-    depends_on:
-      mysql:
-        condition: service_healthy
-    volumes:
-      - ./.kiosk_state.json:/app/.kiosk_state.json
-      - ./order_photos:/app/order_photos
-      - /tmp/.X11-unix:/tmp/.X11-unix
-    devices:
-      - /dev/dri:/dev/dri
-    ipc: host
-    shm_size: 512m
-
   cloudflared:
     image: cloudflare/cloudflared:latest
     container_name: smartlocker-cloudflared

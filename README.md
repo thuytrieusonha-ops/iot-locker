@@ -8,7 +8,7 @@ The project is designed for a smart locker kiosk scenario where staff or shipper
 
 - `main.py`: the main locker app for drop-off, pickup, support, and kiosk-facing flows
 - `monitor.py`: the user portal and admin dashboard
-- `kiosk.py`: a kiosk window launcher for touchscreen devices
+- Firefox kiosk mode for the touchscreen interface
 - MySQL persistence for locker orders, users, access tokens, and admin commands
 - MQTT communication between the web app and locker controller
 - Optional email delivery for secure pickup links
@@ -32,7 +32,7 @@ The project is designed for a smart locker kiosk scenario where staff or shipper
 - SQLAlchemy
 - MQTT / Eclipse Mosquitto
 - MySQL
-- PyQt6 / PyWebView
+- Firefox kiosk mode
 - Docker Compose
 
 ## Project Structure
@@ -41,7 +41,7 @@ The project is designed for a smart locker kiosk scenario where staff or shipper
 - `locker_hardware.py` - MQTT client used by the web app
 - `locker_gateway.py` - Raspberry Pi MQTT-to-UART bridge for Arduino Mega
 - `monitor.py` - portal and admin dashboard
-- `kiosk.py` - kiosk browser window
+- `scripts/pi-kiosk.sh` - starts the app and opens it in Firefox kiosk mode
 - `database.py` - database engine and session setup
 - `model.py` - SQLAlchemy models
 - `config.py` - environment variable helpers
@@ -378,10 +378,16 @@ Start the monitor app:
 uv run python monitor.py
 ```
 
-Optional kiosk mode:
+Open the local touchscreen interface in Firefox kiosk mode:
 
 ```bash
-uv run python kiosk.py
+firefox --kiosk http://127.0.0.1:8000
+```
+
+On Raspberry Pi, the helper script starts the app, waits for it to become ready, and then opens Firefox:
+
+```bash
+./scripts/pi-kiosk.sh .env.docker
 ```
 
 ## Docker Workflow
@@ -402,17 +408,12 @@ Default services:
 Optional profiles in `docker-compose.yml`:
 
 - `hardware` for the Raspberry Pi MQTT-to-UART gateway
-- `kiosk` for kiosk container
 - `tunnel` for Cloudflare Tunnel container
 
 Examples:
 
 ```bash
 docker compose --profile hardware up --build
-```
-
-```bash
-docker compose --profile kiosk up --build
 ```
 
 ```bash

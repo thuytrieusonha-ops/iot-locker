@@ -191,7 +191,7 @@ SMARTLOCKER_MONITOR_URL='${MONITOR_URL}'
 
 Sau do restart:
 uv run python monitor.py
-uv run python kiosk.py
+firefox --kiosk http://127.0.0.1:8000
 
 Luu y:
 - Mail cu da gui truoc do se van dung link cu va co the hong.

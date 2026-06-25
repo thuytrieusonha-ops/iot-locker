@@ -36,13 +36,13 @@ from locker_hardware import (
     open_locker_for_dropoff,
     start_hardware,
 )
-from model import AdminCommand, LockerAccessToken, LockerOrder, UserAccount
+from model import AdminCommand, AdminCommandLocker, LockerAccessToken, LockerOrder, UserAccount
 from order_camera import OrderPhotoError, find_order_photo, save_order_photo
 
 
 app = FastAPI(title="Smart Locker UI", version="1.0.0")
 
-LOCKER_COUNT = 8
+LOCKER_COUNT = max(1, env_int("SMARTLOCKER_LOCKER_COUNT", 8))
 state_lock = Lock()
 
 
@@ -65,7 +65,7 @@ class LockerRecord:
 @dataclass
 class UserAccountRecord:
     phone: str
-    email: str
+    email: str | None
     created_at: datetime
     updated_at: datetime
 
@@ -727,13 +727,30 @@ def using_database() -> bool:
     return is_database_configured()
 
 
+def get_or_create_user_account(session: Session, phone: str) -> UserAccount:
+    account = session.scalar(select(UserAccount).where(UserAccount.phone == phone))
+    if account is not None:
+        return account
+
+    now = datetime.now()
+    account = UserAccount(phone=phone, email=None, created_at=now, updated_at=now)
+    session.add(account)
+    session.flush()
+    return account
+
+
 def get_registered_user(phone: str) -> UserAccountRecord | None:
     if not using_database():
         return registered_users.get(phone)
 
     assert SessionLocal is not None
     with SessionLocal() as session:
-        item = session.scalar(select(UserAccount).where(UserAccount.phone == phone))
+        item = session.scalar(
+            select(UserAccount).where(
+                UserAccount.phone == phone,
+                UserAccount.email.is_not(None),
+            )
+        )
         return to_user_record(item) if item is not None else None
 
 
@@ -1041,6 +1058,27 @@ def parse_unlock_command_note(note: str | None) -> tuple[list[int], str]:
     return list(dict.fromkeys(locker_ids)), " | ".join(detail_parts)
 
 
+def fetch_admin_command_locker_ids(command_id: int) -> list[int]:
+    if not using_database() or SessionLocal is None:
+        return []
+
+    with SessionLocal() as session:
+        return session.scalars(
+            select(AdminCommandLocker.locker_id)
+            .where(AdminCommandLocker.command_id == command_id)
+            .order_by(AdminCommandLocker.locker_id)
+        ).all()
+
+
+def unlock_command_locker_ids(command: AdminCommand) -> list[int]:
+    linked_ids = fetch_admin_command_locker_ids(command.id)
+    if linked_ids:
+        return linked_ids
+
+    parsed_ids, _ = parse_unlock_command_note(command.note)
+    return parsed_ids
+
+
 def fetch_pending_unlock_command() -> AdminCommand | None:
     if not using_database():
         return None
@@ -1151,7 +1189,8 @@ def admin_command_banner() -> str:
 
 def render_admin_command_modal(command: AdminCommand) -> str:
     created_text = now_text(command.created_at)
-    locker_ids, note_text = parse_unlock_command_note(command.note)
+    _, note_text = parse_unlock_command_note(command.note)
+    locker_ids = unlock_command_locker_ids(command)
     if command.action == "unlock_single_locker" and locker_ids:
         action_label = "Mở nhiều tủ" if len(locker_ids) > 1 else f"Mở Tủ {locker_ids[0]}"
         locker_line = f"<p>Yêu cầu mở: <strong>{', '.join(f'Tủ {locker_id}' for locker_id in locker_ids)}</strong>.</p>"
@@ -1188,6 +1227,7 @@ def admin_command_payload() -> dict[str, object]:
         return {"has_pending": False, "html": "", "modal_html": ""}
 
     hardware_result = execute_admin_unlock_command(command)
+    locker_ids = unlock_command_locker_ids(command)
     return {
         "has_pending": True,
         "id": command.id,
@@ -1196,6 +1236,7 @@ def admin_command_payload() -> dict[str, object]:
         "created_at": now_text(command.created_at),
         "note": command.note or "",
         "hardware_result": hardware_result,
+        "locker_ids": locker_ids,
         "html": "",
         "modal_html": render_admin_command_modal(command),
     }
@@ -1255,7 +1296,7 @@ def create_record(
         if not using_database():
             locker_id = find_empty_locker()
             if locker_id is None:
-                raise HTTPException(status_code=409, detail="Hiện tại 8 tủ đã đầy, vui lòng thử lại sau.")
+                raise HTTPException(status_code=409, detail=f"Hiện tại {LOCKER_COUNT} tủ đã đầy, vui lòng thử lại sau.")
 
             pickup_code = generate_pickup_code()
             while any(record and record.pickup_code == pickup_code for record in lockers.values()):
@@ -1278,15 +1319,17 @@ def create_record(
 
         assert SessionLocal is not None
         with SessionLocal() as session:
+            account = get_or_create_user_account(session, phone)
             locker_id = find_empty_locker(session)
             if locker_id is None:
-                raise HTTPException(status_code=409, detail="Hiện tại 8 tủ đã đầy, vui lòng thử lại sau.")
+                raise HTTPException(status_code=409, detail=f"Hiện tại {LOCKER_COUNT} tủ đã đầy, vui lòng thử lại sau.")
 
             pickup_code = generate_pickup_code()
             while session.scalar(select(func.count()).select_from(LockerOrder).where(LockerOrder.pickup_code == pickup_code)):
                 pickup_code = generate_pickup_code()
 
             item = LockerOrder(
+                user_id=account.id,
                 locker_id=locker_id,
                 phone=phone,
                 pickup_code=pickup_code,
@@ -4287,7 +4330,9 @@ def sync_kiosk_user_email(phone: str, email: str, force_resend: bool = False) ->
         now = datetime.now()
         previous_email = account.email if account is not None else None
         if account is None:
-            session.add(UserAccount(phone=phone, email=email, created_at=now, updated_at=now))
+            account = UserAccount(phone=phone, email=email, created_at=now, updated_at=now)
+            session.add(account)
+            session.flush()
             action = "đăng ký mới"
         else:
             account.email = email
@@ -4301,6 +4346,9 @@ def sync_kiosk_user_email(phone: str, email: str, force_resend: bool = False) ->
         orders = session.scalars(select(LockerOrder).where(LockerOrder.phone == phone).order_by(desc(LockerOrder.created_at))).all()
         queued_count = 0
         for item in orders:
+            if item.user_id is None:
+                item.user_id = account.id
+
             if item.status != "stored":
                 continue
 

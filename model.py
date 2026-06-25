@@ -40,7 +40,7 @@ class Locker(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     site_id: Mapped[int] = mapped_column(
-        ForeignKey("locker_sites.id", ondelete="RESTRICT", onupdate="CASCADE"),
+        ForeignKey("locker_sites.id", name="fk_lockers_site", ondelete="RESTRICT", onupdate="CASCADE"),
         nullable=False,
         index=True,
     )
@@ -61,12 +61,12 @@ class LockerOrder(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int | None] = mapped_column(
-        ForeignKey("users.id", ondelete="SET NULL", onupdate="CASCADE"),
+        ForeignKey("users.id", name="fk_locker_orders_user", ondelete="SET NULL", onupdate="CASCADE"),
         nullable=True,
         index=True,
     )
     locker_id: Mapped[int] = mapped_column(
-        ForeignKey("lockers.id", ondelete="RESTRICT", onupdate="CASCADE"),
+        ForeignKey("lockers.id", name="fk_locker_orders_locker", ondelete="RESTRICT", onupdate="CASCADE"),
         nullable=False,
         index=True,
     )
@@ -92,12 +92,12 @@ class LockerAccessToken(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     order_id: Mapped[int] = mapped_column(
-        ForeignKey("locker_orders.id", ondelete="CASCADE", onupdate="CASCADE"),
+        ForeignKey("locker_orders.id", name="fk_locker_access_tokens_order", ondelete="CASCADE", onupdate="CASCADE"),
         nullable=False,
         index=True,
     )
     locker_id: Mapped[int] = mapped_column(
-        ForeignKey("lockers.id", ondelete="RESTRICT", onupdate="CASCADE"),
+        ForeignKey("lockers.id", name="fk_locker_access_tokens_locker", ondelete="RESTRICT", onupdate="CASCADE"),
         nullable=False,
         index=True,
     )
@@ -133,11 +133,11 @@ class AdminCommandLocker(Base):
     __tablename__ = "admin_command_lockers"
 
     command_id: Mapped[int] = mapped_column(
-        ForeignKey("admin_commands.id", ondelete="CASCADE", onupdate="CASCADE"),
+        ForeignKey("admin_commands.id", name="fk_admin_command_lockers_command", ondelete="CASCADE", onupdate="CASCADE"),
         primary_key=True,
     )
     locker_id: Mapped[int] = mapped_column(
-        ForeignKey("lockers.id", ondelete="RESTRICT", onupdate="CASCADE"),
+        ForeignKey("lockers.id", name="fk_admin_command_lockers_locker", ondelete="RESTRICT", onupdate="CASCADE"),
         primary_key=True,
     )
 

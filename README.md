@@ -76,7 +76,7 @@ This flow is handled by `monitor.py`.
 
 1. The user opens the portal at `/portal`.
 2. The user enters a phone number and email address.
-3. The system stores or updates the user record in `user_accounts`.
+3. The system stores or updates the user record in `users`.
 4. Later, when a locker order is created for that phone number, the system can use the saved email to deliver a secure pickup link.
 
 There is also a kiosk-facing registration route in `main.py`:
@@ -198,7 +198,7 @@ Admin capabilities:
 - purge all history
 - review issue reports
 
-Unlock operations work through the `admin_commands` table:
+Unlock operations work through the `admin_commands` and `admin_command_lockers` tables:
 
 1. An admin triggers an action from the dashboard.
 2. A command is stored in the database with status `pending`.
@@ -231,10 +231,13 @@ Issue reports are recorded as admin commands so they can appear in the admin das
 
 Main tables:
 
+- `users`: phone and email registrations
+- `locker_sites`: physical sites or groups that contain lockers
+- `lockers`: locker master data
 - `locker_orders`: active and historical locker orders
-- `user_accounts`: phone and email registrations
 - `locker_access_tokens`: secure pickup tokens
 - `admin_commands`: unlock actions and issue reports
+- `admin_command_lockers`: target lockers for admin commands
 
 Important statuses:
 

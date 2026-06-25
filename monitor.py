@@ -17,9 +17,9 @@ from sqlalchemy import delete, desc, select, text
 from config import build_local_url, env_int, env_str
 from database import SessionLocal, init_db, is_database_configured
 from main import retry_email_delivery_for_phone
-from model import AdminCommand, LockerAccessToken, LockerOrder, UserAccount
+from model import AdminCommand, AdminCommandLocker, LockerAccessToken, LockerOrder, UserAccount
 
-LOCKER_COUNT = 8
+LOCKER_COUNT = max(1, env_int("SMARTLOCKER_LOCKER_COUNT", 8))
 MONITOR_HOST = env_str("SMARTLOCKER_MONITOR_HOST", "0.0.0.0") or "0.0.0.0"
 MONITOR_PORT = env_int("SMARTLOCKER_MONITOR_PORT", 8001)
 MONITOR_URL = env_str("SMARTLOCKER_MONITOR_URL")
@@ -299,6 +299,18 @@ def fetch_orders(limit: int = 200) -> list[LockerOrder]:
         return session.scalars(select(LockerOrder).order_by(desc(LockerOrder.created_at)).limit(limit)).all()
 
 
+def get_or_create_user_account(session, phone: str) -> UserAccount:
+    account = session.scalar(select(UserAccount).where(UserAccount.phone == phone))
+    if account is not None:
+        return account
+
+    now = datetime.now()
+    account = UserAccount(phone=phone, email=None, created_at=now, updated_at=now)
+    session.add(account)
+    session.flush()
+    return account
+
+
 def parse_unlock_command_note(note: str | None) -> tuple[list[int], str]:
     if not note:
         return [], ""
@@ -333,6 +345,27 @@ def build_unlock_command_note(locker_ids: list[int] | None, note: str | None) ->
     if note and note.strip():
         parts.append(note.strip())
     return " | ".join(parts) if parts else None
+
+
+def fetch_admin_command_locker_ids(command_id: int) -> list[int]:
+    if not is_database_configured() or SessionLocal is None:
+        return []
+
+    with SessionLocal() as session:
+        return session.scalars(
+            select(AdminCommandLocker.locker_id)
+            .where(AdminCommandLocker.command_id == command_id)
+            .order_by(AdminCommandLocker.locker_id)
+        ).all()
+
+
+def unlock_command_locker_ids(command: AdminCommand) -> list[int]:
+    linked_ids = fetch_admin_command_locker_ids(command.id)
+    if linked_ids:
+        return linked_ids
+
+    parsed_ids, _ = parse_unlock_command_note(command.note)
+    return parsed_ids
 
 
 def get_pending_unlock_command() -> AdminCommand | None:
@@ -377,7 +410,12 @@ def complete_pending_unlock_command(note: str | None = None) -> AdminCommand | N
         return command
 
 
-def create_admin_command(action: str, note: str | None = None, status: str = "pending") -> AdminCommand:
+def create_admin_command(
+    action: str,
+    note: str | None = None,
+    status: str = "pending",
+    locker_ids: list[int] | None = None,
+) -> AdminCommand:
     if not is_database_configured() or SessionLocal is None:
         raise RuntimeError("SMARTLOCKER_DATABASE_URL is not configured.")
 
@@ -390,6 +428,10 @@ def create_admin_command(action: str, note: str | None = None, status: str = "pe
             completed_at=datetime.now() if status != "pending" else None,
         )
         session.add(command)
+        session.flush()
+        for locker_id in list(dict.fromkeys(locker_ids or [])):
+            if 1 <= locker_id <= LOCKER_COUNT:
+                session.add(AdminCommandLocker(command_id=command.id, locker_id=locker_id))
         session.commit()
         session.refresh(command)
         return command
@@ -632,7 +674,8 @@ def admin_pending_html(command: AdminCommand | None) -> str:
     if command is None:
         return ""
 
-    locker_ids, note = parse_unlock_command_note(command.note)
+    _, note = parse_unlock_command_note(command.note)
+    locker_ids = unlock_command_locker_ids(command)
     command_label = ADMIN_ACTION_LABELS.get(command.action, command.action)
     action_line = (
         f"Tủ mục tiêu: {', '.join(f'Tủ {locker_id}' for locker_id in locker_ids)}."
@@ -1243,7 +1286,9 @@ def sync_user_email(phone: str, email: str, force_resend: bool = False) -> tuple
         now = datetime.now()
         previous_email = account.email if account is not None else None
         if account is None:
-            session.add(UserAccount(phone=phone, email=email, created_at=now, updated_at=now))
+            account = UserAccount(phone=phone, email=email, created_at=now, updated_at=now)
+            session.add(account)
+            session.flush()
             action = "đăng ký mới"
         else:
             account.email = email
@@ -1255,20 +1300,25 @@ def sync_user_email(phone: str, email: str, force_resend: bool = False) -> tuple
             action = "tra cứu"
         orders = session.scalars(select(LockerOrder).where(LockerOrder.phone == phone).order_by(desc(LockerOrder.created_at))).all()
         queued_count = 0
-        if email_changed or force_resend:
-            for item in orders:
-                if item.status != "stored":
-                    continue
+        for item in orders:
+            if item.user_id is None:
+                item.user_id = account.id
 
-                queued_count += 1
-                item.recipient_email = email
-                item.email_delivery_status = "pending"
-                item.email_delivery_note = (
-                    "Người dùng yêu cầu gửi lại mail mở tủ từ cổng người dùng."
-                    if force_resend and not email_changed
-                    else "Đã cập nhật email mới từ cổng người dùng, chuẩn bị gửi lại mail cho đơn đang còn trong tủ."
-                )
-                item.email_sent_at = None
+            if not (email_changed or force_resend):
+                continue
+
+            if item.status != "stored":
+                continue
+
+            queued_count += 1
+            item.recipient_email = email
+            item.email_delivery_status = "pending"
+            item.email_delivery_note = (
+                "Người dùng yêu cầu gửi lại mail mở tủ từ cổng người dùng."
+                if force_resend and not email_changed
+                else "Đã cập nhật email mới từ cổng người dùng, chuẩn bị gửi lại mail cho đơn đang còn trong tủ."
+            )
+            item.email_sent_at = None
 
         session.commit()
 
@@ -2043,7 +2093,12 @@ async def admin_unlock_one(request: Request) -> JSONResponse:
             status_code=400,
         )
 
-    create_admin_command("unlock_single_locker", note=build_unlock_command_note(valid_locker_ids, note), status="pending")
+    create_admin_command(
+        "unlock_single_locker",
+        note=build_unlock_command_note(valid_locker_ids, note),
+        status="pending",
+        locker_ids=valid_locker_ids,
+    )
     lockers_text = ", ".join(f"Tủ {locker_id}" for locker_id in valid_locker_ids)
     return JSONResponse({"ok": True, "message": f"Đã gửi yêu cầu mở {lockers_text} tới kiosk."})
 

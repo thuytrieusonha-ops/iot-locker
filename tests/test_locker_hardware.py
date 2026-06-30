@@ -14,6 +14,19 @@ class FakeMessage:
         self.payload = json.dumps({"locker_id": locker_id, "event": event}).encode("utf-8")
 
 
+class FakePublishResult:
+    rc = 0
+
+
+class FakeMqttClient:
+    def __init__(self) -> None:
+        self.published: list[tuple[str, dict[str, object], int, bool]] = []
+
+    def publish(self, topic: str, payload: str, qos: int, retain: bool) -> FakePublishResult:
+        self.published.append((topic, json.loads(payload), qos, retain))
+        return FakePublishResult()
+
+
 class MqttLockerControllerTests(unittest.TestCase):
     def setUp(self) -> None:
         settings = MqttSettings(
@@ -56,6 +69,32 @@ class MqttLockerControllerTests(unittest.TestCase):
 
         self.assertFalse(worker.is_alive())
         self.assertEqual(self.actions, ["open:1", "used:1"])
+
+    def test_occupied_state_is_retained_for_gateway_restart(self) -> None:
+        mqtt_client = FakeMqttClient()
+        self.controller._client = mqtt_client
+        self.controller._connected.set()
+
+        MqttLockerController.mark_locker_used(self.controller, 2)
+        self.controller.mark_locker_empty(3)
+
+        self.assertEqual(
+            mqtt_client.published,
+            [
+                (
+                    "smartlocker/lockers/2/command",
+                    {"command": "set_occupied", "locker_id": 2, "occupied": True},
+                    1,
+                    True,
+                ),
+                (
+                    "smartlocker/lockers/3/command",
+                    {"command": "set_occupied", "locker_id": 3, "occupied": False},
+                    1,
+                    True,
+                ),
+            ],
+        )
 
 
 if __name__ == "__main__":

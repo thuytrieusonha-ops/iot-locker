@@ -118,6 +118,9 @@ class PiMegaGateway:
         except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             print(f"[gateway] Ignored invalid command on {message.topic}: {exc}")
             return
+        if command == "open" and bool(getattr(message, "retain", False)):
+            print(f"[gateway] Ignored retained open command for locker {locker_id}.")
+            return
         threading.Thread(
             target=self._execute_command,
             args=(locker_id, command, payload),

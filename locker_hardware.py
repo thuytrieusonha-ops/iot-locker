@@ -110,10 +110,10 @@ class MqttLockerController:
                 self._pending.pop(request_id, None)
 
     def mark_locker_used(self, locker_id: int) -> None:
-        self._publish(locker_id, "set_occupied", occupied=True)
+        self._publish(locker_id, "set_occupied", retain=True, occupied=True)
 
     def mark_locker_empty(self, locker_id: int) -> None:
-        self._publish(locker_id, "set_occupied", occupied=False)
+        self._publish(locker_id, "set_occupied", retain=True, occupied=False)
 
     def open_locker_for_dropoff(self, locker_id: int) -> None:
         """Open a locker, then turn on its occupied light only after the door closes."""
@@ -172,7 +172,7 @@ class MqttLockerController:
             raise LockerHardwareError(f"Không khởi tạo được MQTT client: {exc}") from exc
         self._client = client
 
-    def _publish(self, locker_id: int, command: str, **values: Any) -> None:
+    def _publish(self, locker_id: int, command: str, retain: bool = False, **values: Any) -> None:
         self._validate_locker_id(locker_id)
         self.start()
         payload = {
@@ -186,7 +186,7 @@ class MqttLockerController:
             topic,
             json.dumps(payload, separators=(",", ":")),
             qos=self.settings.qos,
-            retain=False,
+            retain=retain,
         )
         if result.rc != 0:
             raise LockerHardwareError(f"Không publish được lệnh MQTT (mã lỗi {result.rc}).")

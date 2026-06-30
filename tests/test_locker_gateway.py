@@ -33,6 +33,15 @@ class FakeMqtt:
         self.messages.append((topic, json.loads(payload)))
 
 
+class FakeCommandMessage:
+    def __init__(self, locker_id: int, command: str, request_id: str, retain: bool) -> None:
+        self.topic = f"smartlocker/lockers/{locker_id}/command"
+        self.payload = json.dumps(
+            {"locker_id": locker_id, "command": command, "request_id": request_id}
+        ).encode("utf-8")
+        self.retain = retain
+
+
 class PiMegaGatewayTests(unittest.TestCase):
     def setUp(self) -> None:
         self.gateway = PiMegaGateway()
@@ -83,6 +92,14 @@ class PiMegaGatewayTests(unittest.TestCase):
 
         self.assertEqual(self.serial.writes, [b"OPEN,1\n"])
         self.assertEqual(len(self.mqtt.messages), 2)
+
+    def test_retained_open_command_is_never_sent_to_mega(self) -> None:
+        message = FakeCommandMessage(1, "open", "stale-after-power-loss", retain=True)
+
+        self.gateway._on_message(None, None, message)
+
+        self.assertEqual(self.serial.writes, [])
+        self.assertEqual(self.mqtt.messages, [])
 
 
 if __name__ == "__main__":

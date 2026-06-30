@@ -32,6 +32,7 @@ from locker_hardware import (
     LockerHardwareError,
     close_hardware,
     mark_locker_empty,
+    mark_locker_used,
     open_locker,
     open_locker_for_dropoff,
     start_hardware,
@@ -136,13 +137,19 @@ KIOSK_STATE_FILE = Path(__file__).resolve().parent / ".kiosk_state.json"
 
 @app.on_event("startup")
 def startup() -> None:
+    database_ready = True
     try:
         init_db()
     except SQLAlchemyError as exc:
+        database_ready = False
         print(f"[smartlocker] Database startup warning: {exc}")
     if HARDWARE_ENABLED:
         print("[smartlocker] Locker MQTT hardware enabled.")
         start_hardware()
+        if database_ready and is_database_configured():
+            restore_locker_hardware_state()
+        else:
+            print("[smartlocker] Skipped locker state restore because the database is unavailable.")
 
 
 @app.on_event("shutdown")
@@ -1254,6 +1261,21 @@ def get_active_records() -> list[LockerRecord]:
     return [to_record(record) for record in records]
 
 
+def restore_locker_hardware_state() -> None:
+    """Restore indicator lights from persistent orders without unlocking any locker."""
+    occupied_locker_ids = {record.locker_id for record in get_active_records()}
+    for locker_id in range(1, LOCKER_COUNT + 1):
+        if locker_id in occupied_locker_ids:
+            mark_locker_used(locker_id)
+        else:
+            mark_locker_empty(locker_id)
+    print(
+        "[smartlocker] Restored locker lights from database; occupied lockers: "
+        + (", ".join(map(str, sorted(occupied_locker_ids))) or "none")
+        + "."
+    )
+
+
 def get_history_records(limit: int = 12) -> list[LockerRecord]:
     if not using_database():
         return sorted(history[-limit:], key=lambda item: item.created_at, reverse=True)
@@ -1624,6 +1646,9 @@ def result_panel(
         </section>
     </div>
     """
+
+
+DROPOFF_RESULT_DISPLAY_MS = 12_500
 
 
 def virtual_keyboard() -> str:
@@ -4956,6 +4981,7 @@ async def shipper_dropoff(
     order_code: str = Form(...),
     order_photo_data: str = Form(""),
 ) -> HTMLResponse:
+    door_closed_confirmed = False
     try:
         cleaned_phone = normalize_phone(phone)
         recipient = get_registered_user(cleaned_phone)
@@ -4969,6 +4995,7 @@ async def shipper_dropoff(
         )
         try:
             await to_thread(open_locker_for_dropoff, record.locker_id)
+            door_closed_confirmed = True
         except LockerHardwareError as exc:
             release_record(record)
             raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -4995,8 +5022,9 @@ async def shipper_dropoff(
                 order_photo_path=photo_path,
             )
         result_html = result_panel(
-            "Đã lưu hàng vào tủ",
+            "Tủ đã khóa",
             [
+                f"Tủ {record.locker_id} đã khóa. Đèn báo đã bật.",
                 f"Vị trí tủ đã mở: Tủ {record.locker_id}",
                 f"Mã mở tủ tại kiosk: {record.pickup_code}",
                 f"Mã đơn hàng: {record.order_code or '---'}",
@@ -5008,15 +5036,17 @@ async def shipper_dropoff(
                 ("Mã mở tủ", record.pickup_code),
             ],
             redirect_url="/",
+            redirect_delay_ms=DROPOFF_RESULT_DISPLAY_MS,
         )
     except (HTTPException, LockerHardwareError) as exc:
         result_html = result_panel("Không thể lưu hàng", [user_error_message(exc)], tone="error", redirect_url="/")
     except OSError as exc:
         if 'record' in locals() and recipient is not None:
             record = update_record_email_delivery(record, recipient.email, "failed", str(exc))
+        closed_notice = [f"Tủ {record.locker_id} đã khóa. Đèn báo đã bật."] if door_closed_confirmed else []
         result_html = result_panel(
-            "Đã lưu hàng nhưng chưa gửi được email",
-            [
+            "Tủ đã khóa nhưng chưa gửi được email",
+            closed_notice + [
                 f"Vị trí tủ đã mở: Tủ {record.locker_id}" if 'record' in locals() else "Tủ đã được mở để lưu hàng.",
                 f"Mã mở tủ tại kiosk: {record.pickup_code}" if 'record' in locals() else "Vui lòng kiểm tra lại mã mở tủ tại kiosk.",
                 f"Mã đơn hàng: {record.order_code or '---'}" if 'record' in locals() else "Đơn hàng đã được lưu.",
@@ -5028,6 +5058,7 @@ async def shipper_dropoff(
             ] if 'record' in locals() else None,
             tone="error",
             redirect_url="/",
+            redirect_delay_ms=DROPOFF_RESULT_DISPLAY_MS if door_closed_confirmed else 2500,
         )
 
     return HTMLResponse(

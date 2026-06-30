@@ -1726,13 +1726,18 @@ def page_template(
                 }
             };
     """ if enable_pickup_handoff_polling else ""
-    pickup_handoff_start = """
-            refreshPickupHandoff();
-            window.setInterval(refreshPickupHandoff, 2000);
-    """ if enable_pickup_handoff_polling else ""
     page_script = """
     <script>
         (() => {
+            const params = new URLSearchParams(window.location.search);
+            const kioskModeRequested = params.has("_kiosk");
+            const kioskModeActive = kioskModeRequested || window.sessionStorage.getItem("smartlocker_kiosk_mode") === "1";
+            if (kioskModeActive) {
+                window.sessionStorage.setItem("smartlocker_kiosk_mode", "1");
+                document.documentElement.classList.add("kiosk-performance");
+                document.body.classList.add("kiosk-performance");
+            }
+
             const fields = Array.from(document.querySelectorAll("[data-touch-input='true']"));
             const keyboard = document.querySelector(".keyboard-shell");
             const closeButton = document.querySelector("[data-action='hide-keyboard']");
@@ -1772,15 +1777,19 @@ def page_template(
             let cameraCountdownTimer = null;
             let lastAdminAlertId = Number(window.sessionStorage.getItem("smartlocker_admin_alert_id") || 0);
             let lastPickupHandoffId = Number(window.sessionStorage.getItem("smartlocker_pickup_handoff_id") || 0);
+            let scrollControlFrame = 0;
+            const liveClockOptions = kioskModeActive
+                ? { hour: "2-digit", minute: "2-digit" }
+                : { hour: "2-digit", minute: "2-digit", second: "2-digit" };
+            const liveClockIntervalMs = kioskModeActive ? 30000 : 1000;
+            const pickupHandoffPollIntervalMs = kioskModeActive ? 5000 : 2000;
+            const adminCommandPollIntervalMs = kioskModeActive ? 7000 : 3000;
+            const scrollBehavior = kioskModeActive ? "auto" : "smooth";
 
             const updateLiveTime = () => {
                 const now = new Date();
                 if (liveClock) {
-                    liveClock.textContent = now.toLocaleTimeString("vi-VN", {
-                        hour: "2-digit",
-                        minute: "2-digit",
-                        second: "2-digit",
-                    });
+                    liveClock.textContent = now.toLocaleTimeString("vi-VN", liveClockOptions);
                 }
                 if (liveDate) {
                     liveDate.textContent = now.toLocaleDateString("vi-VN", {
@@ -1817,7 +1826,7 @@ def page_template(
             };
 
             const scrollOnePage = (direction) => {
-                window.scrollBy({ top: direction * window.innerHeight * 0.72, behavior: "smooth" });
+                window.scrollBy({ top: direction * window.innerHeight * 0.72, behavior: scrollBehavior });
             };
 
             if (scrollControl && scrollTrack && scrollThumb) {
@@ -1847,7 +1856,7 @@ def page_template(
                     const rect = scrollTrack.getBoundingClientRect();
                     const ratio = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
                     const maxScroll = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
-                    window.scrollTo({ top: ratio * maxScroll, behavior: "smooth" });
+                    window.scrollTo({ top: ratio * maxScroll, behavior: scrollBehavior });
                 });
             }
 
@@ -1906,12 +1915,14 @@ def page_template(
                     return;
                 }
 
-                const scale = Math.min(1, 1280 / sourceWidth);
+                const targetMaxWidth = kioskModeActive ? 960 : 1280;
+                const jpegQuality = kioskModeActive ? 0.74 : 0.86;
+                const scale = Math.min(1, targetMaxWidth / sourceWidth);
                 const canvas = document.createElement("canvas");
                 canvas.width = Math.round(sourceWidth * scale);
                 canvas.height = Math.round(sourceHeight * scale);
                 canvas.getContext("2d").drawImage(cameraVideo, 0, 0, canvas.width, canvas.height);
-                const photoData = canvas.toDataURL("image/jpeg", 0.86);
+                const photoData = canvas.toDataURL("image/jpeg", jpegQuality);
                 cameraPhotoData.value = photoData;
                 cameraPreviewImage.src = photoData;
                 cameraPreview.classList.remove("is-hidden");
@@ -2064,7 +2075,7 @@ def page_template(
             const ensureFieldVisible = (field) => {
                 if (!field) return;
                 window.requestAnimationFrame(() => {
-                    field.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
+                    field.scrollIntoView({ behavior: scrollBehavior, block: "center", inline: "nearest" });
                 });
             };
 
@@ -2207,24 +2218,33 @@ def page_template(
                 hideKeyboard();
             });
 
-            window.addEventListener("scroll", updateScrollControl, { passive: true });
+            const queueScrollControlUpdate = () => {
+                if (scrollControlFrame) return;
+                scrollControlFrame = window.requestAnimationFrame(() => {
+                    scrollControlFrame = 0;
+                    updateScrollControl();
+                });
+            };
+
+            window.addEventListener("scroll", queueScrollControlUpdate, { passive: true });
             window.addEventListener("resize", () => {
                 updateKeyboardSpace();
-                updateScrollControl();
+                queueScrollControlUpdate();
             });
             if (window.visualViewport) {
                 window.visualViewport.addEventListener("resize", updateKeyboardSpace);
             }
 
             updateLiveTime();
-            window.setInterval(updateLiveTime, 1000);
+            window.setInterval(updateLiveTime, liveClockIntervalMs);
             updateLetterKeys();
             updateKeyboardSpace();
             updateScrollControl();
-            window.requestAnimationFrame(updateScrollControl);
+            queueScrollControlUpdate();
 
 """ + ("""
             const refreshAdminCommand = async () => {
+                if (document.visibilityState === "hidden") return;
                 try {
                     const response = await fetch("/api/admin-command", { cache: "no-store" });
                     if (!response.ok) {
@@ -2249,9 +2269,16 @@ def page_template(
 """ + pickup_handoff_script + """
 """ + ("""
             refreshAdminCommand();
-            window.setInterval(refreshAdminCommand, 3000);
+            window.setInterval(refreshAdminCommand, adminCommandPollIntervalMs);
 """ if enable_admin_command_polling else "") + """
-""" + pickup_handoff_start + """
+""" + ("""
+            const refreshPickupHandoffWithVisibility = async () => {
+                if (document.visibilityState === "hidden") return;
+                await refreshPickupHandoff();
+            };
+            refreshPickupHandoffWithVisibility();
+            window.setInterval(refreshPickupHandoffWithVisibility, pickupHandoffPollIntervalMs);
+""" if enable_pickup_handoff_polling else "") + """
         })();
     </script>
     """
@@ -2294,6 +2321,10 @@ def page_template(
                 scrollbar-width: none;
             }}
 
+            html.kiosk-performance {{
+                scroll-behavior: auto;
+            }}
+
             html::-webkit-scrollbar {{
                 display: none;
             }}
@@ -2312,6 +2343,14 @@ def page_template(
                 padding-right: 72px;
             }}
 
+            body.kiosk-performance {{
+                background: #eef5ff;
+            }}
+
+            .kiosk-performance * {{
+                animation: none !important;
+            }}
+
             .kiosk-scroll-control {{
                 position: fixed;
                 z-index: 90;
@@ -2328,6 +2367,11 @@ def page_template(
                 background: rgba(255, 255, 255, 0.96);
                 box-shadow: 0 12px 30px rgba(10, 67, 138, 0.18);
                 touch-action: none;
+            }}
+
+            .kiosk-performance .kiosk-scroll-control {{
+                background: #ffffff;
+                box-shadow: none;
             }}
 
             .kiosk-scroll-control.is-hidden {{
@@ -2376,6 +2420,11 @@ def page_template(
                 touch-action: none;
             }}
 
+            .kiosk-performance .kiosk-scroll-thumb {{
+                background: #0b4fae;
+                box-shadow: none;
+            }}
+
             .kiosk-scroll-thumb:active {{
                 cursor: grabbing;
             }}
@@ -2413,6 +2462,10 @@ def page_template(
                 padding: 28px;
                 background: rgba(11, 34, 69, 0.36);
                 backdrop-filter: blur(6px);
+            }}
+
+            .kiosk-performance .admin-alert-backdrop {{
+                backdrop-filter: none;
             }}
 
             .admin-alert {{
@@ -2458,6 +2511,16 @@ def page_template(
                 backdrop-filter: blur(10px);
                 border-radius: 18px;
                 padding: 12px 16px;
+            }}
+
+            .kiosk-performance .brand-chip,
+            .kiosk-performance .clock-card,
+            .kiosk-performance .panel,
+            .kiosk-performance .home-link,
+            .kiosk-performance .assist-card {{
+                backdrop-filter: none;
+                box-shadow: none;
+                background: #ffffff;
             }}
 
             .brand-chip {{
@@ -2570,6 +2633,29 @@ def page_template(
                 height: 100%;
                 position: relative;
                 overflow: hidden;
+            }}
+
+            .kiosk-performance .main-button,
+            .kiosk-performance .action-send,
+            .kiosk-performance .action-deliver,
+            .kiosk-performance .action-receive,
+            .kiosk-performance .main-button.secondary {{
+                background: #0b4fae;
+                box-shadow: none;
+            }}
+
+            .kiosk-performance .main-button.secondary,
+            .kiosk-performance .main-button.secondary span,
+            .kiosk-performance .main-button.secondary .button-icon svg {{
+                color: #ffffff;
+                stroke: #ffffff;
+            }}
+
+            .kiosk-performance .main-button::after,
+            .kiosk-performance .button-icon,
+            .kiosk-performance .assist-card-icon {{
+                background: rgba(255, 255, 255, 0.12);
+                box-shadow: none;
             }}
 
             .main-button::after {{
@@ -3018,6 +3104,12 @@ def page_template(
                 box-shadow: 0 24px 60px rgba(0, 0, 0, 0.36);
             }}
 
+            .kiosk-performance .order-camera-dialog,
+            .kiosk-performance .result-modal,
+            .kiosk-performance .keyboard-shell {{
+                box-shadow: none;
+            }}
+
             .order-camera-head {{
                 display: flex;
                 align-items: center;
@@ -3188,6 +3280,10 @@ def page_template(
                 background: rgba(11, 79, 174, 0.12);
                 backdrop-filter: blur(4px);
                 z-index: 30;
+            }}
+
+            .kiosk-performance .result-modal-backdrop {{
+                backdrop-filter: none;
             }}
 
             .result-modal {{
@@ -3500,6 +3596,10 @@ def page_template(
                 transition: transform 0.22s ease, opacity 0.22s ease;
                 z-index: 60;
                 box-shadow: 0 20px 48px rgba(3, 24, 57, 0.32);
+            }}
+
+            .kiosk-performance .keyboard-shell {{
+                transition: none;
             }}
 
             .keyboard-shell.visible {{
@@ -5338,7 +5438,8 @@ async def report_issue(
 def main() -> None:
     import uvicorn
 
-    uvicorn.run("main:app", host=APP_HOST, port=APP_PORT, reload=True)
+    reload_enabled = env_str("SMARTLOCKER_RELOAD", "").lower() in {"1", "true", "yes", "on"}
+    uvicorn.run("main:app", host=APP_HOST, port=APP_PORT, reload=reload_enabled)
 
 
 if __name__ == "__main__":

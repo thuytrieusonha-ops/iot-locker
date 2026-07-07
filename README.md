@@ -8,7 +8,7 @@ The project is designed for a smart locker kiosk scenario where staff or shipper
 
 - `main.py`: the main locker app for drop-off, pickup, support, and kiosk-facing flows
 - `monitor.py`: the user portal and admin dashboard
-- Firefox kiosk mode for the touchscreen interface
+- Chromium kiosk mode for the touchscreen interface, with Firefox fallback
 - MySQL persistence for locker orders, users, access tokens, and admin commands
 - MQTT communication between the web app and locker controller
 - Optional email delivery for secure pickup links
@@ -32,7 +32,7 @@ The project is designed for a smart locker kiosk scenario where staff or shipper
 - SQLAlchemy
 - MQTT / Eclipse Mosquitto
 - MySQL
-- Firefox kiosk mode
+- Chromium or Firefox kiosk mode
 - Docker Compose
 
 ## Project Structure
@@ -41,7 +41,7 @@ The project is designed for a smart locker kiosk scenario where staff or shipper
 - `locker_hardware.py` - MQTT client used by the web app
 - `locker_gateway.py` - Raspberry Pi MQTT-to-UART bridge for Arduino Mega
 - `monitor.py` - portal and admin dashboard
-- `scripts/pi-kiosk.sh` - starts the app and opens it in Firefox kiosk mode
+- `scripts/pi-kiosk.sh` - starts the app and opens it in browser kiosk mode
 - `database.py` - database engine and session setup
 - `model.py` - SQLAlchemy models
 - `config.py` - environment variable helpers
@@ -123,6 +123,12 @@ If SMTP is configured and the recipient has a registered email:
 3. Only the token hash is stored in `locker_access_tokens`.
 4. The email is sent to the registered recipient.
 5. Email delivery result is saved back to the locker order.
+
+If the Raspberry Pi loses network while sending, the order stays in
+`email_delivery_status="pending"` instead of becoming `failed`. A background
+worker checks connectivity and retries pending emails when the network is back.
+SMTP configuration/authentication problems still become `smtp_missing` or
+`failed` so they are not hidden as network outages.
 
 This keeps the pickup link safer than sending only a plain pickup code.
 
@@ -262,7 +268,7 @@ Create a `.env` file in the project root.
 Example:
 
 ```bash
-SMARTLOCKER_DATABASE_URL="mysql+pymysql://root:password@127.0.0.1:3306/smartlocker"
+SMARTLOCKER_DATABASE_URL="mysql+pymysql://root:password@127.0.0.1:3307/smartlocker"
 SMARTLOCKER_APP_HOST="0.0.0.0"
 SMARTLOCKER_APP_PORT="8000"
 SMARTLOCKER_BASE_URL="http://127.0.0.1:8000"
@@ -282,6 +288,11 @@ SMARTLOCKER_SMTP_USERNAME="your-email@gmail.com"
 SMARTLOCKER_SMTP_PASSWORD="your-app-password"
 SMARTLOCKER_SMTP_FROM_EMAIL="your-email@gmail.com"
 SMARTLOCKER_SMTP_USE_TLS="true"
+SMARTLOCKER_SMTP_PENDING_RETRY_SECONDS="60"
+SMARTLOCKER_SMTP_PENDING_BATCH_SIZE="10"
+SMARTLOCKER_SMTP_NETWORK_CHECK_HOST="smtp.gmail.com"
+SMARTLOCKER_SMTP_NETWORK_CHECK_PORT="587"
+SMARTLOCKER_SMTP_NETWORK_CHECK_TIMEOUT_SECONDS="3"
 ```
 
 Optional MQTT locker control:
@@ -344,6 +355,12 @@ Web app -> MQTT broker -> Raspberry Pi gateway -> UART -> Arduino Mega
 Web app <- MQTT ACK    <- Raspberry Pi gateway <- UART <- Arduino Mega
 ```
 
+The Arduino Mega must run the serial gateway firmware in
+`arduino/mega_smart_locker/mega_smart_locker.ino`. If the gateway log shows a
+banner such as `DIRECT SWITCH READY`, the Mega is running a direct-switch sketch
+that does not accept monitor commands. Upload the serial gateway sketch, then
+adjust its relay, occupied LED, and door sensor pin arrays to match the wiring.
+
 UART commands sent by the Pi:
 
 - `OPEN,{locker_id}`
@@ -378,16 +395,37 @@ Start the monitor app:
 uv run python monitor.py
 ```
 
-Open the local touchscreen interface in Firefox kiosk mode:
+Open the local touchscreen interface in browser kiosk mode:
 
 ```bash
-firefox --kiosk http://127.0.0.1:8000
+chromium-browser --kiosk 'http://127.0.0.1:8000?_kiosk=1'
 ```
 
-On Raspberry Pi, the helper script starts the app, waits for it to become ready, and then opens Firefox:
+On Raspberry Pi, the helper script starts the app, waits for it to become ready, and then opens Chromium with lightweight kiosk flags. If Chromium is not installed, it falls back to Firefox:
 
 ```bash
 ./scripts/pi-kiosk.sh .env.docker
+```
+
+To open Firefox directly without a generated profile, set:
+
+```bash
+SMARTLOCKER_KIOSK_BROWSER='firefox'
+SMARTLOCKER_KIOSK_FIREFOX_DIRECT='true'
+```
+
+Then the autostart helper will wait for the local app and run Firefox with `-kiosk`.
+
+Kiosk performance can be tuned from `.env.docker`:
+
+```bash
+SMARTLOCKER_KIOSK_PERFORMANCE='true'
+SMARTLOCKER_KIOSK_PICKUP_HANDOFF_POLL_MS='6000'
+SMARTLOCKER_KIOSK_ADMIN_COMMAND_POLL_MS='10000'
+SMARTLOCKER_KIOSK_FETCH_TIMEOUT_MS='4000'
+SMARTLOCKER_KIOSK_BROWSER='auto'
+SMARTLOCKER_MONITOR_POLL_MS='15000'
+SMARTLOCKER_MONITOR_FETCH_TIMEOUT_MS='5000'
 ```
 
 ## Docker Workflow
@@ -404,20 +442,16 @@ Default services:
 - monitor: `http://localhost:8001`
 - mysql: `localhost:3307`
 - mqtt: `localhost:1883`
+- cloudflared: Cloudflare Tunnel for the public app and monitor hostnames
 
 Optional profiles in `docker-compose.yml`:
 
 - `hardware` for the Raspberry Pi MQTT-to-UART gateway
-- `tunnel` for Cloudflare Tunnel container
 
 Examples:
 
 ```bash
 docker compose --profile hardware up --build
-```
-
-```bash
-docker compose --profile tunnel up --build
 ```
 
 ## Recommended Real-World Flow

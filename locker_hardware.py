@@ -5,6 +5,7 @@ import os
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -64,6 +65,7 @@ class MqttLockerController:
         self._door_event_sequence = 0
         self._door_open_sequence: dict[int, int] = {}
         self._door_closed_sequence: dict[int, int] = {}
+        self._door_events: deque[dict[str, Any]] = deque(maxlen=200)
 
     def start(self) -> None:
         with self._client_lock:
@@ -241,13 +243,26 @@ class MqttLockerController:
             if event_name in {"door_open", "door_closed"}:
                 with self._door_condition:
                     self._door_event_sequence += 1
+                    sequence = self._door_event_sequence
                     if event_name == "door_open":
-                        self._door_open_sequence[locker_id] = self._door_event_sequence
+                        self._door_open_sequence[locker_id] = sequence
                     else:
-                        self._door_closed_sequence[locker_id] = self._door_event_sequence
+                        self._door_closed_sequence[locker_id] = sequence
+                    self._door_events.append(
+                        {
+                            "sequence": sequence,
+                            "locker_id": locker_id,
+                            "event": event_name,
+                            "created_at": time.time(),
+                        }
+                    )
                     self._door_condition.notify_all()
 
         print(f"[smartlocker] MQTT event {message.topic}: {payload}")
+
+    def door_events_after(self, sequence: int = 0) -> list[dict[str, Any]]:
+        with self._door_condition:
+            return [dict(event) for event in self._door_events if int(event["sequence"]) > sequence]
 
     @staticmethod
     def _validate_locker_id(locker_id: int) -> None:
@@ -318,6 +333,10 @@ def mark_locker_used(locker_id: int) -> None:
 
 def mark_locker_empty(locker_id: int) -> None:
     _publish_state_with_fallback(locker_id, occupied=False)
+
+
+def get_locker_door_events(after_sequence: int = 0) -> list[dict[str, Any]]:
+    return controller.door_events_after(after_sequence)
 
 
 def _publish_state_with_fallback(locker_id: int, occupied: bool) -> None:

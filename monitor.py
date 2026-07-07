@@ -12,12 +12,13 @@ from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from sqlalchemy import delete, desc, select, text
+from sqlalchemy import delete, desc, select, text, update
 
 from config import build_local_url, env_int, env_str
 from database import SessionLocal, init_db, is_database_configured
+from locker_hardware import LockerHardwareError, mark_locker_empty
 from main import retry_email_delivery_for_phone
-from model import AdminCommand, AdminCommandLocker, LockerAccessToken, LockerOrder, UserAccount
+from model import AdminCommand, AdminCommandLocker, Locker, LockerAccessToken, LockerOrder, UserAccount
 
 LOCKER_COUNT = max(1, env_int("SMARTLOCKER_LOCKER_COUNT", 8))
 MONITOR_HOST = env_str("SMARTLOCKER_MONITOR_HOST", "0.0.0.0") or "0.0.0.0"
@@ -33,6 +34,8 @@ SESSION_TTL_HOURS = max(1, env_int("SMARTLOCKER_ADMIN_SESSION_HOURS", 12))
 ADMIN_CSRF_HEADER = "x-csrf-token"
 ADMIN_LOGIN_WINDOW_SECONDS = max(60, env_int("SMARTLOCKER_ADMIN_LOGIN_WINDOW_SECONDS", 600))
 ADMIN_LOGIN_MAX_ATTEMPTS = max(3, env_int("SMARTLOCKER_ADMIN_LOGIN_MAX_ATTEMPTS", 5))
+MONITOR_POLL_MS = max(5000, env_int("SMARTLOCKER_MONITOR_POLL_MS", 15000))
+MONITOR_FETCH_TIMEOUT_MS = max(2000, env_int("SMARTLOCKER_MONITOR_FETCH_TIMEOUT_MS", 5000))
 admin_sessions: dict[str, dict[str, object]] = {}
 admin_login_attempts: dict[str, list[datetime]] = {}
 ACTIVE_ADMIN_LOCK_MESSAGE = "Đã có một quản trị viên khác đang đăng nhập. Hãy đăng xuất phiên hiện tại trước."
@@ -61,6 +64,7 @@ ADMIN_ACTION_LABELS = {
     "unlock_single_locker": "Mở tủ đã chọn",
     "purge_collected_history": "Xóa dữ liệu đã nhận",
     "purge_all_history": "Xóa toàn bộ dữ liệu",
+    "system_reset": "Reset hệ thống",
     "issue_report": "Báo cáo sự cố",
 }
 
@@ -466,6 +470,32 @@ def purge_orders(scope: str) -> int:
         return deleted_count
 
 
+def reset_system_state() -> tuple[int, list[str]]:
+    if not is_database_configured() or SessionLocal is None:
+        raise RuntimeError("SMARTLOCKER_DATABASE_URL is not configured.")
+
+    with SessionLocal() as session:
+        order_count = session.scalar(select(text("COUNT(*)")).select_from(LockerOrder.__table__)) or 0
+        session.execute(delete(LockerAccessToken))
+        session.execute(delete(LockerOrder))
+        session.execute(delete(AdminCommandLocker))
+        session.execute(delete(AdminCommand))
+        session.execute(update(Locker).values(status="active", updated_at=datetime.now()))
+        session.commit()
+        session.execute(text("ALTER TABLE locker_orders AUTO_INCREMENT = 1"))
+        session.execute(text("ALTER TABLE locker_access_tokens AUTO_INCREMENT = 1"))
+        session.execute(text("ALTER TABLE admin_commands AUTO_INCREMENT = 1"))
+        session.commit()
+
+    light_errors: list[str] = []
+    for locker_id in range(1, LOCKER_COUNT + 1):
+        try:
+            mark_locker_empty(locker_id)
+        except LockerHardwareError as exc:
+            light_errors.append(f"Tủ {locker_id}: {exc}")
+    return int(order_count), light_errors
+
+
 def fetch_issue_reports(limit: int = 50) -> list[AdminCommand]:
     if not is_database_configured() or SessionLocal is None:
         return []
@@ -717,14 +747,14 @@ def page_shell(title: str, subtitle: str, content: str, script: str = "") -> str
                 --shadow: 0 24px 50px rgba(17, 76, 131, 0.10);
             }}
             * {{ box-sizing: border-box; }}
+            * {{
+                -webkit-tap-highlight-color: transparent;
+            }}
             body {{
                 margin: 0;
                 font-family: "Aptos", "Segoe UI Variable", "Segoe UI", Tahoma, sans-serif;
                 color: var(--text);
-                background:
-                    radial-gradient(circle at top right, rgba(21, 112, 239, 0.16), transparent 28%),
-                    radial-gradient(circle at left top, rgba(111, 180, 255, 0.18), transparent 22%),
-                    linear-gradient(180deg, #ffffff 0%, var(--bg) 100%);
+                background: var(--bg);
                 min-height: 100vh;
             }}
             .page {{
@@ -821,7 +851,6 @@ def page_shell(title: str, subtitle: str, content: str, script: str = "") -> str
                 background: var(--panel);
                 border: 1px solid var(--line);
                 border-radius: 22px;
-                box-shadow: var(--shadow);
             }}
             .panel, .notice, .role-card {{ padding: 18px; margin-bottom: 16px; }}
             .panel, .notice {{
@@ -1036,6 +1065,8 @@ def page_shell(title: str, subtitle: str, content: str, script: str = "") -> str
                 border-radius: 16px;
                 background: rgba(255, 255, 255, 0.92);
                 contain: layout paint;
+                content-visibility: auto;
+                contain-intrinsic-size: 1px 520px;
                 -webkit-overflow-scrolling: touch;
             }}
             table {{ width: 100%; border-collapse: collapse; min-width: 1080px; }}
@@ -1119,26 +1150,51 @@ def page_shell(title: str, subtitle: str, content: str, script: str = "") -> str
             .admin-field-wide {{ grid-column: 1 / -1; }}
             .locker-select-grid {{
                 display: grid;
-                grid-template-columns: repeat(4, minmax(0, 1fr));
+                grid-template-columns: repeat(3, minmax(0, 1fr));
                 gap: 10px;
+                max-width: 560px;
             }}
+            .locker-select-screen,
             .locker-select-button {{
                 border: 1px solid var(--line);
                 border-radius: 16px;
                 padding: 12px 10px;
+                min-height: 82px;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
                 background: linear-gradient(180deg, #ffffff 0%, #eef5ff 100%);
                 color: #0d4f8f;
-                cursor: pointer;
                 text-align: center;
+            }}
+            .locker-select-button {{
+                cursor: pointer;
             }}
             .locker-select-button.active {{
                 background: linear-gradient(180deg, #1678d8 0%, #0b4fae 100%);
                 color: #fff;
             }}
+            .locker-select-screen {{
+                background: linear-gradient(180deg, #12263f 0%, #0b1628 100%);
+                color: #dbeafe;
+                border-color: rgba(11, 79, 174, 0.32);
+                cursor: default;
+            }}
+            .locker-select-placeholder {{
+                min-height: 82px;
+                border: 1px dashed rgba(18, 93, 160, 0.18);
+                border-radius: 16px;
+                background: rgba(255, 255, 255, 0.38);
+            }}
             .locker-select-button span,
-            .locker-select-button strong {{ display: block; }}
-            .locker-select-button span {{ font-size: 0.86rem; margin-bottom: 6px; }}
-            .locker-select-button strong {{ font-size: 1.12rem; }}
+            .locker-select-button strong,
+            .locker-select-screen span,
+            .locker-select-screen strong {{ display: block; }}
+            .locker-select-button span,
+            .locker-select-screen span {{ font-size: 0.86rem; margin-bottom: 6px; }}
+            .locker-select-button strong,
+            .locker-select-screen strong {{ font-size: 1.12rem; }}
             .admin-actions {{
                 display: grid;
                 grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1161,16 +1217,24 @@ def page_shell(title: str, subtitle: str, content: str, script: str = "") -> str
             @media (max-width: 980px) {{
                 .grid-roles, .summary-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
                 .form-grid, .admin-grid, .admin-actions {{ grid-template-columns: 1fr; }}
-                .locker-select-grid {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
+                .locker-select-grid {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
                 .hero, .section-head {{ flex-direction: column; align-items: start; }}
                 .role-card {{ flex-direction: column; align-items: start; }}
                 .role-action {{ width: 100%; }}
             }}
             @media (max-width: 640px) {{
                 .page {{ padding: 20px 14px 28px; }}
-                .grid-roles, .summary-grid, .locker-grid, .locker-select-grid {{ grid-template-columns: 1fr; }}
+                .grid-roles, .summary-grid, .locker-grid {{ grid-template-columns: 1fr; }}
                 .form-actions {{ grid-template-columns: 1fr; }}
                 .locker-line {{ grid-template-columns: 62px minmax(0, 1fr); }}
+                .locker-select-grid {{ gap: 8px; }}
+                .locker-select-button,
+                .locker-select-screen,
+                .locker-select-placeholder {{
+                    min-height: 70px;
+                    border-radius: 14px;
+                    padding: 10px 6px;
+                }}
                 .role-card {{
                     min-height: 220px;
                 }}
@@ -1247,7 +1311,7 @@ def home_page() -> str:
 
             const renderClock = () => {
                 const now = new Date();
-                timeEl.textContent = now.toLocaleTimeString("vi-VN", { hour12: false });
+                timeEl.textContent = now.toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" });
                 dateEl.textContent = now.toLocaleDateString("vi-VN", {
                     weekday: "long",
                     day: "2-digit",
@@ -1257,7 +1321,7 @@ def home_page() -> str:
             };
 
             renderClock();
-            window.setInterval(renderClock, 1000);
+            window.setInterval(renderClock, 30000);
         })();
     </script>
     """
@@ -1493,16 +1557,36 @@ def admin_panel_html(payload: dict[str, object], csrf_token: str) -> str:
     if not configured:
         return ""
 
-    pending_state = str(payload.get("admin_pending_html", ""))
-    locker_selector = "".join(
-        f"""
+    def locker_select_button(locker_id: int) -> str:
+        return f"""
         <button type="button" class="locker-select-button" data-locker-choice="{locker_id}">
             <span>Tủ</span>
             <strong>{locker_id}</strong>
         </button>
         """
-        for locker_id in range(1, LOCKER_COUNT + 1)
-    )
+
+    physical_layout: list[int | None] = [1, 2, 3, 4, None, 5, 6, 7, 8]
+    locker_selector_cells: list[str] = []
+    for locker_id in physical_layout:
+        if locker_id is None:
+            locker_selector_cells.append(
+                """
+                <div class="locker-select-screen" aria-label="Vị trí màn hình">
+                    <span>Vị trí</span>
+                    <strong>Màn hình</strong>
+                </div>
+                """
+            )
+        elif locker_id <= LOCKER_COUNT:
+            locker_selector_cells.append(locker_select_button(locker_id))
+        else:
+            locker_selector_cells.append('<div class="locker-select-placeholder" aria-hidden="true"></div>')
+
+    if LOCKER_COUNT > 8:
+        locker_selector_cells.extend(locker_select_button(locker_id) for locker_id in range(9, LOCKER_COUNT + 1))
+
+    pending_state = str(payload.get("admin_pending_html", ""))
+    locker_selector = "".join(locker_selector_cells)
 
     return f"""
     <section class="panel admin-panel">
@@ -1539,16 +1623,17 @@ def admin_panel_html(payload: dict[str, object], csrf_token: str) -> str:
             </section>
             <section class="admin-card">
                 <h3>Dữ liệu hệ thống</h3>
-                <p>Các thao tác xóa yêu cầu chuỗi xác nhận để tránh thao tác nhầm.</p>
+                <p>Các thao tác xóa/reset yêu cầu chuỗi xác nhận để tránh thao tác nhầm.</p>
                 <div class="admin-grid single">
                     <label class="admin-field">
-                        <span>Xác nhận xóa dữ liệu</span>
-                        <input id="admin-confirmation" type="text" placeholder="Nhập XOA_DU_LIEU để xác nhận">
+                        <span>Xác nhận thao tác</span>
+                        <input id="admin-confirmation" type="text" placeholder="Nhập XOA_DU_LIEU hoặc RESET_HE_THONG">
                     </label>
                 </div>
                 <div class="admin-actions">
                     <button type="button" class="button warning" data-admin-action="purge-collected">Xóa dữ liệu đã nhận</button>
                     <button type="button" class="button warning" data-admin-action="purge-all">Xóa toàn bộ dữ liệu</button>
+                    <button type="button" class="button warning" data-admin-action="reset-system">Reset hệ thống</button>
                     <form method="post" action="/admin/logout">
                         <input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
                         <button type="submit" class="button secondary" style="width:100%">Đăng xuất</button>
@@ -1796,13 +1881,29 @@ def admin_dashboard_page(csrf_token: str = "") -> str:
                 }}
             }};
 
+            let monitorPollDelayMs = {MONITOR_POLL_MS};
+            const monitorFetchTimeoutMs = {MONITOR_FETCH_TIMEOUT_MS};
+
+            const fetchMonitorPayload = async () => {{
+                const controller = new AbortController();
+                const timeoutId = window.setTimeout(() => controller.abort(), monitorFetchTimeoutMs);
+                try {{
+                    return await fetch("/api/admin/monitor", {{
+                        cache: "no-store",
+                        signal: controller.signal,
+                    }});
+                }} finally {{
+                    window.clearTimeout(timeoutId);
+                }}
+            }};
+
             const refreshMonitor = async () => {{
                 if (isRefreshing || document.hidden) {{
                     return;
                 }}
                 isRefreshing = true;
                 try {{
-                    const response = await fetch("/api/admin/monitor", {{ cache: "no-store" }});
+                    const response = await fetchMonitorPayload();
                     if (response.status === 403) {{
                         window.location.href = "/admin";
                         return;
@@ -1823,8 +1924,10 @@ def admin_dashboard_page(csrf_token: str = "") -> str:
                         applyPayload(payload);
                         lastPayloadHash = nextHash;
                     }}
+                    monitorPollDelayMs = {MONITOR_POLL_MS};
                 }} catch (error) {{
                     setAdminFeedback("Không thể lấy dữ liệu mới. Hệ thống sẽ tự thử lại.", "error");
+                    monitorPollDelayMs = Math.min({MONITOR_POLL_MS} * 4, Math.max(monitorPollDelayMs * 2, {MONITOR_POLL_MS}));
                 }} finally {{
                     isRefreshing = false;
                 }}
@@ -1871,6 +1974,8 @@ def admin_dashboard_page(csrf_token: str = "") -> str:
                             payload = await postAdminAction("/api/admin/purge-collected", adminConfirmation?.value || "");
                         }} else if (action === "purge-all") {{
                             payload = await postAdminAction("/api/admin/purge-all", adminConfirmation?.value || "");
+                        }} else if (action === "reset-system") {{
+                            payload = await postAdminAction("/api/admin/reset-system", adminConfirmation?.value || "");
                         }} else {{
                             return;
                         }}
@@ -1893,8 +1998,14 @@ def admin_dashboard_page(csrf_token: str = "") -> str:
             }});
 
             renderLockerSelection(getSelectedLockerIds());
+            const scheduleMonitorRefresh = () => {{
+                window.setTimeout(async () => {{
+                    await refreshMonitor();
+                    scheduleMonitorRefresh();
+                }}, monitorPollDelayMs);
+            }};
             refreshMonitor();
-            window.setInterval(refreshMonitor, 10000);
+            scheduleMonitorRefresh();
         }})();
     </script>
     """
@@ -2145,6 +2256,40 @@ async def admin_purge_all(request: Request) -> JSONResponse:
         status="completed",
     )
     return JSONResponse({"ok": True, "message": f"Đã xóa toàn bộ dữ liệu, tổng cộng {deleted_count} bản ghi."})
+
+
+@app.post("/api/admin/reset-system", response_class=JSONResponse)
+async def admin_reset_system(request: Request) -> JSONResponse:
+    if not admin_enabled() or not is_admin_authenticated(request):
+        return unauthorized_response()
+    try:
+        require_admin_csrf(request, request.headers.get(ADMIN_CSRF_HEADER, ""))
+    except HTTPException as exc:
+        return unauthorized_response(str(exc.detail))
+
+    _, note, confirmation = await read_admin_request(request)
+    if confirmation.strip().upper() != "RESET_HE_THONG":
+        return JSONResponse({"ok": False, "detail": "Cần nhập RESET_HE_THONG để xác nhận reset hệ thống."}, status_code=400)
+
+    deleted_count, light_errors = reset_system_state()
+    reset_note_parts = [note.strip()] if note.strip() else []
+    reset_note_parts.append(f"deleted_orders={deleted_count}")
+    if light_errors:
+        reset_note_parts.append(f"light_errors={len(light_errors)}")
+    create_admin_command("system_reset", note=" | ".join(reset_note_parts), status="completed")
+
+    if light_errors:
+        return JSONResponse(
+            {
+                "ok": True,
+                "message": (
+                    f"Đã reset dữ liệu và trạng thái tủ, xóa {deleted_count} đơn. "
+                    f"Có {len(light_errors)} đèn báo chưa xác nhận tắt được."
+                ),
+                "warnings": light_errors,
+            }
+        )
+    return JSONResponse({"ok": True, "message": f"Đã reset toàn bộ hệ thống, xóa {deleted_count} đơn và tắt đèn tất cả tủ."})
 
 
 def main() -> None:

@@ -2,7 +2,7 @@ name: smartlocker
 
 x-smartlocker-db-env: &smartlocker-db-env
   SMARTLOCKER_DATABASE_HOST: mysql
-  SMARTLOCKER_DATABASE_PORT: 3306
+  SMARTLOCKER_DATABASE_PORT: 3307
   SMARTLOCKER_DATABASE_NAME: ${MYSQL_DATABASE:-smartlocker}
   SMARTLOCKER_DATABASE_USER: ${MYSQL_USER:-smartlocker_user}
   SMARTLOCKER_DATABASE_PASSWORD: ${MYSQL_PASSWORD:-Locker123!}
@@ -22,18 +22,19 @@ services:
     image: mysql:8.4
     container_name: smartlocker-mysql
     restart: unless-stopped
+    command: ["--port=3307"]
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-smartlocker}
       MYSQL_USER: ${MYSQL_USER:-smartlocker_user}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-Locker123!}
     ports:
-      - "${MYSQL_HOST_PORT:-3307}:3306"
+      - "${MYSQL_HOST_PORT:-3307}:3307"
     volumes:
       - mysql-data:/var/lib/mysql
       - ./mysql_schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -P 3307 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -103,6 +104,7 @@ services:
       <<: *smartlocker-db-env
       SMARTLOCKER_MONITOR_HOST: 0.0.0.0
       SMARTLOCKER_MONITOR_PORT: 8001
+      SMARTLOCKER_MQTT_CLIENT_ID: smartlocker-monitor
     command: ["uvicorn", "monitor:app", "--host", "0.0.0.0", "--port", "8001"]
     ports:
       - "${SMARTLOCKER_MONITOR_HOST_PORT:-8001}:8001"
@@ -122,8 +124,6 @@ services:
     image: cloudflare/cloudflared:latest
     container_name: smartlocker-cloudflared
     restart: unless-stopped
-    profiles:
-      - tunnel
     command: ["tunnel", "--config", "/etc/cloudflared/config.docker.yml", "run"]
     depends_on:
       app:

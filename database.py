@@ -255,7 +255,7 @@ def seed_default_lockers() -> None:
                             site_id = VALUES(site_id),
                             locker_number = VALUES(locker_number),
                             display_name = VALUES(display_name),
-                            status = VALUES(status),
+                            status = lockers.status,
                             updated_at = VALUES(updated_at)
                         """
                     ),
@@ -447,6 +447,8 @@ def ensure_schema_updates() -> None:
             )
 
     if "admin_commands" in table_names:
+        if engine.dialect.name == "mysql":
+            statements.append("ALTER TABLE admin_commands MODIFY COLUMN note VARCHAR(1024) NULL")
         admin_command_checks = _constraint_names(inspector, "admin_commands", "check")
         if "ck_admin_commands_status" not in admin_command_checks:
             statements.append(

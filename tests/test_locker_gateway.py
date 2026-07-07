@@ -101,6 +101,18 @@ class PiMegaGatewayTests(unittest.TestCase):
         self.assertEqual(self.serial.writes, [])
         self.assertEqual(self.mqtt.messages, [])
 
+    def test_door_lines_from_mega_are_published_as_mqtt_events(self) -> None:
+        self.gateway._handle_uart_line("DOOR_OPEN,4")
+        self.gateway._handle_uart_line("DOOR_CLOSED,4")
+
+        self.assertEqual(
+            self.mqtt.messages,
+            [
+                ("smartlocker/lockers/4/event", {"locker_id": 4, "event": "door_open"}),
+                ("smartlocker/lockers/4/event", {"locker_id": 4, "event": "door_closed"}),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

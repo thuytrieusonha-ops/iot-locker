@@ -15,7 +15,7 @@ class PiMegaGateway:
 
     def __init__(self) -> None:
         self.uart_port = os.getenv("SMARTLOCKER_UART_PORT", "/dev/serial0").strip() or "/dev/serial0"
-        self.uart_baudrate = env_int("SMARTLOCKER_UART_BAUDRATE", 9600)
+        self.uart_baudrate = env_int("SMARTLOCKER_UART_BAUDRATE", 115200)
         self.uart_timeout = max(0.01, env_float("SMARTLOCKER_UART_TIMEOUT", 0.2))
         self.command_timeout = max(0.1, env_float("SMARTLOCKER_UART_COMMAND_TIMEOUT", 3.0))
         self.locker_count = max(1, env_int("SMARTLOCKER_LOCKER_COUNT", 8))

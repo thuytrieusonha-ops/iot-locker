@@ -52,5 +52,5 @@ def build_database_url() -> str:
 
     dialect = env_str("SMARTLOCKER_DATABASE_DIALECT", "mysql+pymysql")
     password = quote_plus(os.getenv("SMARTLOCKER_DATABASE_PASSWORD", ""))
-    port = env_int("SMARTLOCKER_DATABASE_PORT", 3306)
+    port = env_int("SMARTLOCKER_DATABASE_PORT", 3307)
     return f"{dialect}://{quote_plus(user)}:{password}@{host}:{port}/{database}"

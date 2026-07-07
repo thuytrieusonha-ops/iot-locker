@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import os
 import secrets
+import socket
 import smtplib
 import time
 from asyncio import to_thread
@@ -16,7 +18,7 @@ from html import escape
 from io import BytesIO
 from pathlib import Path
 from re import fullmatch
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -31,13 +33,14 @@ from locker_hardware import (
     HARDWARE_ENABLED,
     LockerHardwareError,
     close_hardware,
+    get_locker_door_events,
     mark_locker_empty,
     mark_locker_used,
     open_locker,
     open_locker_for_dropoff,
     start_hardware,
 )
-from model import AdminCommand, AdminCommandLocker, LockerAccessToken, LockerOrder, UserAccount
+from model import AdminCommand, AdminCommandLocker, Locker, LockerAccessToken, LockerOrder, UserAccount
 from order_camera import OrderPhotoError, find_order_photo, save_order_photo
 
 
@@ -45,6 +48,16 @@ app = FastAPI(title="Smart Locker UI", version="1.0.0")
 
 LOCKER_COUNT = max(1, env_int("SMARTLOCKER_LOCKER_COUNT", 8))
 state_lock = Lock()
+locker_light_sync_stop = Event()
+locker_light_sync_thread: Thread | None = None
+locker_light_sync_pause_count = 0
+locker_light_sync_pause_lock = Lock()
+admin_command_worker_stop = Event()
+admin_command_worker_thread: Thread | None = None
+admin_command_execution_lock = Lock()
+email_delivery_worker_stop = Event()
+email_delivery_worker_thread: Thread | None = None
+email_delivery_lock = Lock()
 
 
 @dataclass
@@ -124,6 +137,11 @@ SMTP_USE_TLS = os.getenv("SMARTLOCKER_SMTP_USE_TLS", "true").strip().lower() not
 SMTP_INCLUDE_QR = os.getenv("SMARTLOCKER_SMTP_INCLUDE_QR", "false").strip().lower() in {"1", "true", "yes"}
 SMTP_RETRY_ATTEMPTS = max(1, int(os.getenv("SMARTLOCKER_SMTP_RETRY_ATTEMPTS", "3") or "3"))
 SMTP_RETRY_DELAY_SECONDS = max(5, int(os.getenv("SMARTLOCKER_SMTP_RETRY_DELAY_SECONDS", "20") or "20"))
+SMTP_PENDING_RETRY_SECONDS = max(30, env_int("SMARTLOCKER_SMTP_PENDING_RETRY_SECONDS", 60))
+SMTP_PENDING_BATCH_SIZE = max(1, env_int("SMARTLOCKER_SMTP_PENDING_BATCH_SIZE", 10))
+SMTP_NETWORK_CHECK_HOST = env_str("SMARTLOCKER_SMTP_NETWORK_CHECK_HOST", SMTP_HOST or "8.8.8.8")
+SMTP_NETWORK_CHECK_PORT = env_int("SMARTLOCKER_SMTP_NETWORK_CHECK_PORT", SMTP_PORT if SMTP_HOST else 53)
+SMTP_NETWORK_CHECK_TIMEOUT_SECONDS = max(1, env_int("SMARTLOCKER_SMTP_NETWORK_CHECK_TIMEOUT_SECONDS", 3))
 BASE_URL = os.getenv("SMARTLOCKER_BASE_URL", "").strip().rstrip("/")
 MONITOR_URL = os.getenv("SMARTLOCKER_MONITOR_URL", "").strip().rstrip("/")
 MONITOR_USER_PORTAL_URL = os.getenv(
@@ -132,7 +150,14 @@ MONITOR_USER_PORTAL_URL = os.getenv(
 ).strip().rstrip("/")
 APP_HOST = env_str("SMARTLOCKER_APP_HOST", "0.0.0.0") or "0.0.0.0"
 APP_PORT = env_int("SMARTLOCKER_APP_PORT", 8000)
+KIOSK_PERFORMANCE_DEFAULT = env_str("SMARTLOCKER_KIOSK_PERFORMANCE", "true").lower() not in {"0", "false", "no", "off"}
+KIOSK_PICKUP_HANDOFF_POLL_MS = max(3000, env_int("SMARTLOCKER_KIOSK_PICKUP_HANDOFF_POLL_MS", 6000))
+KIOSK_ADMIN_COMMAND_POLL_MS = max(5000, env_int("SMARTLOCKER_KIOSK_ADMIN_COMMAND_POLL_MS", 10000))
+KIOSK_DOOR_EVENT_POLL_MS = max(1000, env_int("SMARTLOCKER_KIOSK_DOOR_EVENT_POLL_MS", 2000))
+KIOSK_FETCH_TIMEOUT_MS = max(1500, env_int("SMARTLOCKER_KIOSK_FETCH_TIMEOUT_MS", 4000))
+LOCKER_LIGHT_SYNC_SECONDS = max(5, env_int("SMARTLOCKER_LOCKER_LIGHT_SYNC_SECONDS", 20))
 KIOSK_STATE_FILE = Path(__file__).resolve().parent / ".kiosk_state.json"
+ADMIN_COMMAND_NOTE_MAX_LENGTH = 1024
 
 
 @app.on_event("startup")
@@ -140,6 +165,8 @@ def startup() -> None:
     database_ready = True
     try:
         init_db()
+        if is_database_configured():
+            reconcile_locker_master_state()
     except SQLAlchemyError as exc:
         database_ready = False
         print(f"[smartlocker] Database startup warning: {exc}")
@@ -148,12 +175,19 @@ def startup() -> None:
         start_hardware()
         if database_ready and is_database_configured():
             restore_locker_hardware_state()
+            start_locker_light_sync()
         else:
             print("[smartlocker] Skipped locker state restore because the database is unavailable.")
+    if database_ready and is_database_configured():
+        start_admin_command_worker()
+        start_email_delivery_worker()
 
 
 @app.on_event("shutdown")
 def shutdown() -> None:
+    stop_email_delivery_worker()
+    stop_admin_command_worker()
+    stop_locker_light_sync()
     close_hardware()
 
 
@@ -366,6 +400,59 @@ def get_base_url(request: Request | None = None) -> str:
 
 def email_delivery_enabled() -> bool:
     return bool(SMTP_HOST and SMTP_FROM_EMAIL)
+
+
+NETWORK_ERROR_ERRNOS = {
+    errno.EHOSTDOWN,
+    errno.EHOSTUNREACH,
+    errno.ENETDOWN,
+    errno.ENETUNREACH,
+    errno.ENONET,
+    errno.ETIMEDOUT,
+}
+
+
+def has_network_connection() -> bool:
+    if not SMTP_NETWORK_CHECK_HOST:
+        return True
+    try:
+        with socket.create_connection(
+            (SMTP_NETWORK_CHECK_HOST, SMTP_NETWORK_CHECK_PORT),
+            timeout=SMTP_NETWORK_CHECK_TIMEOUT_SECONDS,
+        ):
+            return True
+    except OSError:
+        return False
+
+
+def is_network_connectivity_error(exc: BaseException) -> bool:
+    if isinstance(exc, (socket.gaierror, TimeoutError)):
+        return True
+    if isinstance(exc, OSError):
+        error_number = getattr(exc, "errno", None)
+        if error_number in NETWORK_ERROR_ERRNOS:
+            return True
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                "network is unreachable",
+                "temporary failure in name resolution",
+                "name or service not known",
+                "no route to host",
+                "connection timed out",
+            )
+        )
+    if isinstance(exc, smtplib.SMTPServerDisconnected):
+        return not has_network_connection()
+    return False
+
+
+def pending_network_email_note(last_error: str = "") -> str:
+    note = "Pi đang mất mạng nên email được giữ lại trong hàng chờ. Hệ thống sẽ tự gửi khi mạng hoạt động lại."
+    if last_error:
+        return f"{note} Lỗi gần nhất: {last_error}"[:255]
+    return note
 
 
 def build_pickup_code_qr_url(pickup_code: str, request: Request | None = None) -> str:
@@ -642,6 +729,16 @@ def queue_pickup_email_delivery(
                 return
             except (OSError, smtplib.SMTPException, TimeoutError) as exc:
                 last_error = str(exc)
+                if is_network_connectivity_error(exc):
+                    update_record_email_delivery(
+                        queued_record,
+                        email,
+                        "pending",
+                        pending_network_email_note(last_error),
+                        None,
+                        active_base_url,
+                    )
+                    return
                 if attempt >= SMTP_RETRY_ATTEMPTS or not is_retryable_email_error(exc):
                     break
                 time.sleep(SMTP_RETRY_DELAY_SECONDS)
@@ -692,6 +789,111 @@ def retry_email_delivery_for_phone(phone: str, email: str, request: Request | No
             update_record_email_delivery(to_record(order), email, "failed", str(exc))
 
     return attempted, delivered
+
+
+def pending_email_orders(limit: int = SMTP_PENDING_BATCH_SIZE) -> list[LockerRecord]:
+    if not using_database() or not email_delivery_enabled():
+        return []
+
+    assert SessionLocal is not None
+    with SessionLocal() as session:
+        orders = session.scalars(
+            select(LockerOrder)
+            .where(
+                LockerOrder.status == "stored",
+                LockerOrder.recipient_email.is_not(None),
+                LockerOrder.email_delivery_status == "pending",
+                LockerOrder.email_delivery_note.like("Pi đang mất mạng%"),
+            )
+            .order_by(LockerOrder.created_at)
+            .limit(limit)
+        ).all()
+        return [to_record(order) for order in orders]
+
+
+def deliver_pending_email_order(record: LockerRecord) -> bool:
+    if not record.recipient_email:
+        return False
+    try:
+        _, sent, _ = deliver_pickup_email(record, record.recipient_email)
+        return sent
+    except (OSError, smtplib.SMTPException, TimeoutError) as exc:
+        if is_network_connectivity_error(exc):
+            update_record_email_delivery(
+                record,
+                record.recipient_email,
+                "pending",
+                pending_network_email_note(str(exc)),
+                None,
+                record.email_link_base_url,
+            )
+        else:
+            update_record_email_delivery(
+                record,
+                record.recipient_email,
+                "failed",
+                str(exc),
+                None,
+                record.email_link_base_url,
+            )
+        return False
+    except Exception as exc:
+        update_record_email_delivery(
+            record,
+            record.recipient_email,
+            "failed",
+            str(exc),
+            None,
+            record.email_link_base_url,
+        )
+        return False
+
+
+def retry_pending_email_deliveries_once() -> tuple[int, int]:
+    if not using_database() or not email_delivery_enabled():
+        return 0, 0
+    if not has_network_connection():
+        return 0, 0
+    if not email_delivery_lock.acquire(blocking=False):
+        return 0, 0
+
+    try:
+        records = pending_email_orders()
+        delivered = 0
+        for record in records:
+            if deliver_pending_email_order(record):
+                delivered += 1
+        return len(records), delivered
+    finally:
+        email_delivery_lock.release()
+
+
+def email_delivery_worker_loop() -> None:
+    while not email_delivery_worker_stop.is_set():
+        try:
+            attempted, delivered = retry_pending_email_deliveries_once()
+            if attempted:
+                print(f"[smartlocker] Pending email retry: sent {delivered}/{attempted}.")
+        except Exception as exc:
+            print(f"[smartlocker] Pending email worker warning: {exc}")
+        email_delivery_worker_stop.wait(SMTP_PENDING_RETRY_SECONDS)
+
+
+def start_email_delivery_worker() -> None:
+    global email_delivery_worker_thread
+    if email_delivery_worker_thread is not None and email_delivery_worker_thread.is_alive():
+        return
+    if not email_delivery_enabled():
+        return
+    email_delivery_worker_stop.clear()
+    email_delivery_worker_thread = Thread(target=email_delivery_worker_loop, name="email-delivery-retry", daemon=True)
+    email_delivery_worker_thread.start()
+
+
+def stop_email_delivery_worker() -> None:
+    email_delivery_worker_stop.set()
+    if email_delivery_worker_thread is not None:
+        email_delivery_worker_thread.join(timeout=2)
 
 
 def generate_pickup_code() -> str:
@@ -1040,6 +1242,7 @@ def mark_pickup_access_used(raw_token: str, phone_last4: str) -> LockerRecord:
             access_item.status = "used"
             access_item.used_at = datetime.now()
             order.status = "collected"
+            set_locker_master_status(session, order.locker_id, occupied=False)
             session.commit()
             session.refresh(order)
             return to_record(order)
@@ -1139,10 +1342,39 @@ def claim_pending_unlock_command_for_display() -> AdminCommand | None:
     command = fetch_pending_unlock_command()
     if command is None:
         return None
-    if command.id <= last_seen_admin_command_id():
-        return None
     mark_admin_command_seen(command.id)
     return command
+
+
+def complete_stale_unlock_commands(latest_command_id: int) -> None:
+    if not using_database():
+        return
+
+    assert SessionLocal is not None
+    with SessionLocal() as session:
+        stale_commands = session.scalars(
+            select(AdminCommand).where(
+                AdminCommand.action.in_(("unlock_all_lockers", "unlock_single_locker")),
+                AdminCommand.status == "pending",
+                AdminCommand.id < latest_command_id,
+            )
+        ).all()
+        if not stale_commands:
+            return
+
+        now = datetime.now()
+        for stale_command in stale_commands:
+            stale_command.status = "completed"
+            stale_command.completed_at = now
+            stale_command.note = " | ".join(
+                part
+                for part in [
+                    stale_command.note or "",
+                    f"superseded_by_command_id={latest_command_id}",
+                ]
+                if part
+            )
+        session.commit()
 
 
 def complete_unlock_command(command_id: int, note: str) -> None:
@@ -1155,13 +1387,22 @@ def complete_unlock_command(command_id: int, note: str) -> None:
         if command is None:
             return
         command.status = "completed"
-        command.note = " | ".join(part for part in [command.note or "", note] if part)
+        command.note = compact_admin_command_note(command.note, note)
         command.completed_at = datetime.now()
         session.commit()
 
 
+def compact_admin_command_note(existing_note: str | None, result_note: str) -> str:
+    combined = " | ".join(part for part in [existing_note or "", result_note] if part)
+    if len(combined) <= ADMIN_COMMAND_NOTE_MAX_LENGTH:
+        return combined
+    suffix = "..."
+    return combined[: ADMIN_COMMAND_NOTE_MAX_LENGTH - len(suffix)].rstrip() + suffix
+
+
 def execute_admin_unlock_command(command: AdminCommand) -> str:
-    locker_ids, _ = parse_unlock_command_note(command.note)
+    complete_stale_unlock_commands(command.id)
+    locker_ids = unlock_command_locker_ids(command)
     if command.action == "unlock_all_lockers":
         target_ids = list(range(1, LOCKER_COUNT + 1))
     else:
@@ -1184,17 +1425,54 @@ def execute_admin_unlock_command(command: AdminCommand) -> str:
     if failed_messages:
         message = "; ".join(failed_messages)
     else:
-        message = "Đã gửi lệnh mở " + ", ".join(f"Tủ {locker_id}" for locker_id in opened_ids)
+        message = ", ".join(f"Tủ {locker_id} đã mở" for locker_id in opened_ids) + "."
 
     complete_unlock_command(command.id, f"kiosk_result={message}")
     return message
+
+
+def execute_pending_admin_unlock_command() -> tuple[AdminCommand, str] | None:
+    if not admin_command_execution_lock.acquire(blocking=False):
+        return None
+    try:
+        command = claim_pending_unlock_command_for_display()
+        if command is None:
+            return None
+        return command, execute_admin_unlock_command(command)
+    finally:
+        admin_command_execution_lock.release()
+
+
+def admin_command_worker_loop() -> None:
+    poll_seconds = KIOSK_ADMIN_COMMAND_POLL_MS / 1000
+    while not admin_command_worker_stop.is_set():
+        try:
+            execute_pending_admin_unlock_command()
+        except Exception as exc:
+            print(f"[smartlocker] Admin command worker warning: {exc}")
+        admin_command_worker_stop.wait(poll_seconds)
+
+
+def start_admin_command_worker() -> None:
+    global admin_command_worker_thread
+    if admin_command_worker_thread is not None and admin_command_worker_thread.is_alive():
+        return
+    admin_command_worker_stop.clear()
+    admin_command_worker_thread = Thread(target=admin_command_worker_loop, daemon=True)
+    admin_command_worker_thread.start()
+
+
+def stop_admin_command_worker() -> None:
+    admin_command_worker_stop.set()
+    if admin_command_worker_thread is not None:
+        admin_command_worker_thread.join(timeout=2)
 
 
 def admin_command_banner() -> str:
     return ""
 
 
-def render_admin_command_modal(command: AdminCommand) -> str:
+def render_admin_command_modal(command: AdminCommand, hardware_result: str = "") -> str:
     created_text = now_text(command.created_at)
     _, note_text = parse_unlock_command_note(command.note)
     locker_ids = unlock_command_locker_ids(command)
@@ -1205,6 +1483,12 @@ def render_admin_command_modal(command: AdminCommand) -> str:
         action_label = ADMIN_ACTION_LABELS.get(command.action, command.action)
         locker_line = "<p>Yêu cầu mở toàn bộ các tủ.</p>"
     note = f"<p class=\"admin-alert-note\">Ghi chú: {escape(note_text)}</p>" if note_text else ""
+    result = f"""
+            <div class="result-panel">
+                <strong>Thông báo mở tủ</strong>
+                <p>{escape(hardware_result)}</p>
+            </div>
+    """ if hardware_result else ""
     return f"""
     <div class="admin-alert-backdrop" data-admin-alert data-command-id="{command.id}">
         <section class="admin-alert" role="alert" aria-live="assertive" aria-labelledby="admin-alert-title">
@@ -1214,6 +1498,7 @@ def render_admin_command_modal(command: AdminCommand) -> str:
             <p>Thời gian phát lệnh: {escape(created_text)}</p>
             {locker_line}
             <p>Hãy kiểm tra và xử lý theo quy trình vận hành hoặc dùng lệnh này cho bộ điều khiển khóa khi tích hợp Raspberry Pi.</p>
+            {result}
             {note}
         </section>
     </div>
@@ -1221,19 +1506,19 @@ def render_admin_command_modal(command: AdminCommand) -> str:
 
 
 def admin_command_modal() -> str:
-    command = claim_pending_unlock_command_for_display()
-    if command is None:
+    result = execute_pending_admin_unlock_command()
+    if result is None:
         return ""
-    execute_admin_unlock_command(command)
-    return render_admin_command_modal(command)
+    command, hardware_result = result
+    return render_admin_command_modal(command, hardware_result)
 
 
 def admin_command_payload() -> dict[str, object]:
-    command = claim_pending_unlock_command_for_display()
-    if command is None:
+    result = execute_pending_admin_unlock_command()
+    if result is None:
         return {"has_pending": False, "html": "", "modal_html": ""}
 
-    hardware_result = execute_admin_unlock_command(command)
+    command, hardware_result = result
     locker_ids = unlock_command_locker_ids(command)
     return {
         "has_pending": True,
@@ -1245,7 +1530,7 @@ def admin_command_payload() -> dict[str, object]:
         "hardware_result": hardware_result,
         "locker_ids": locker_ids,
         "html": "",
-        "modal_html": render_admin_command_modal(command),
+        "modal_html": render_admin_command_modal(command, hardware_result),
     }
 
 
@@ -1261,9 +1546,40 @@ def get_active_records() -> list[LockerRecord]:
     return [to_record(record) for record in records]
 
 
+def active_locker_ids(session: Session) -> set[int]:
+    return {
+        int(locker_id)
+        for locker_id in session.scalars(
+            select(LockerOrder.locker_id).where(LockerOrder.status == "stored")
+        ).all()
+    }
+
+
+def set_locker_master_status(session: Session, locker_id: int, occupied: bool) -> None:
+    session.execute(
+        update(Locker)
+        .where(Locker.id == locker_id)
+        .values(status="occupied" if occupied else "active", updated_at=datetime.now())
+    )
+
+
+def reconcile_locker_master_state() -> set[int]:
+    """Make locker master status match active stored orders after restart."""
+    if not using_database():
+        return {locker_id for locker_id, record in lockers.items() if record and record.status == "stored"}
+
+    assert SessionLocal is not None
+    with SessionLocal() as session:
+        occupied_locker_ids = active_locker_ids(session)
+        for locker_id in range(1, LOCKER_COUNT + 1):
+            set_locker_master_status(session, locker_id, locker_id in occupied_locker_ids)
+        session.commit()
+    return occupied_locker_ids
+
+
 def restore_locker_hardware_state() -> None:
     """Restore indicator lights from persistent orders without unlocking any locker."""
-    occupied_locker_ids = {record.locker_id for record in get_active_records()}
+    occupied_locker_ids = reconcile_locker_master_state()
     for locker_id in range(1, LOCKER_COUNT + 1):
         if locker_id in occupied_locker_ids:
             mark_locker_used(locker_id)
@@ -1274,6 +1590,49 @@ def restore_locker_hardware_state() -> None:
         + (", ".join(map(str, sorted(occupied_locker_ids))) or "none")
         + "."
     )
+
+
+def start_locker_light_sync() -> None:
+    global locker_light_sync_thread
+
+    if locker_light_sync_thread is not None and locker_light_sync_thread.is_alive():
+        return
+
+    locker_light_sync_stop.clear()
+
+    def worker() -> None:
+        while not locker_light_sync_stop.wait(LOCKER_LIGHT_SYNC_SECONDS):
+            if is_locker_light_sync_paused():
+                continue
+            try:
+                restore_locker_hardware_state()
+            except (LockerHardwareError, SQLAlchemyError, OperationalError) as exc:
+                print(f"[smartlocker] Locker light sync warning: {exc}")
+
+    locker_light_sync_thread = Thread(target=worker, name="locker-light-sync", daemon=True)
+    locker_light_sync_thread.start()
+    print(f"[smartlocker] Locker light sync enabled every {LOCKER_LIGHT_SYNC_SECONDS}s.")
+
+
+def stop_locker_light_sync() -> None:
+    locker_light_sync_stop.set()
+
+
+def pause_locker_light_sync() -> None:
+    global locker_light_sync_pause_count
+    with locker_light_sync_pause_lock:
+        locker_light_sync_pause_count += 1
+
+
+def resume_locker_light_sync() -> None:
+    global locker_light_sync_pause_count
+    with locker_light_sync_pause_lock:
+        locker_light_sync_pause_count = max(0, locker_light_sync_pause_count - 1)
+
+
+def is_locker_light_sync_paused() -> bool:
+    with locker_light_sync_pause_lock:
+        return locker_light_sync_pause_count > 0
 
 
 def get_history_records(limit: int = 12) -> list[LockerRecord]:
@@ -1294,14 +1653,12 @@ def find_empty_locker(session: Session | None = None) -> int | None:
         return None
 
     assert session is not None
-    occupied = {
-        locker_id
-        for locker_id in session.scalars(
-            select(LockerOrder.locker_id).where(LockerOrder.status == "stored")
-        ).all()
-    }
+    occupied = active_locker_ids(session)
     for locker_id in range(1, LOCKER_COUNT + 1):
-        if locker_id not in occupied:
+        if locker_id in occupied:
+            continue
+        locker_status = session.scalar(select(Locker.status).where(Locker.id == locker_id))
+        if locker_status in {None, "active", "empty"}:
             return locker_id
     return None
 
@@ -1364,6 +1721,7 @@ def create_record(
                 status="stored",
             )
             session.add(item)
+            set_locker_master_status(session, locker_id, occupied=True)
             session.commit()
             session.refresh(item)
             return to_record(item)
@@ -1391,6 +1749,7 @@ def release_record(record: LockerRecord) -> None:
             )
             if item is not None:
                 item.status = "collected"
+                set_locker_master_status(session, item.locker_id, occupied=False)
                 session.commit()
 
 
@@ -1435,6 +1794,7 @@ def collect_record(phone: str, pickup_code: str) -> LockerRecord:
                 )
                 if item is not None:
                     item.status = "collected"
+                    set_locker_master_status(session, item.locker_id, occupied=False)
                     session.commit()
                     session.refresh(item)
                     return to_record(item)
@@ -1460,6 +1820,7 @@ def collect_record_by_last4(pickup_code: str, phone_last4: str) -> LockerRecord:
                 )
                 if item is not None and item.phone[-4:] == phone_last4:
                     item.status = "collected"
+                    set_locker_master_status(session, item.locker_id, occupied=False)
                     session.commit()
                     session.refresh(item)
                     return to_record(item)
@@ -1606,6 +1967,8 @@ def result_panel(
     redirect_url: str | None = None,
     redirect_delay_ms: int = 2500,
     extra_html: str = "",
+    suppress_door_events: bool = False,
+    compact: bool = False,
 ) -> str:
     if not lines:
         return ""
@@ -1631,10 +1994,13 @@ def result_panel(
             f' data-redirect-url="{escape(redirect_url)}"'
             f' data-redirect-delay="{redirect_delay_ms}"'
         )
+    suppress_door_event_attr = ' data-suppress-door-events="true"' if suppress_door_events else ""
+
+    modal_classes = f"result-modal {escape(tone)}{' compact' if compact else ''}"
 
     return f"""
-    <div class="result-modal-backdrop" data-result-modal{redirect_attrs}>
-        <section class="result-modal {escape(tone)}" role="dialog" aria-modal="true" aria-labelledby="result-title">
+    <div class="result-modal-backdrop" data-result-modal{redirect_attrs}{suppress_door_event_attr}>
+        <section class="{modal_classes}" role="dialog" aria-modal="true" aria-labelledby="result-title">
             <button type="button" class="result-modal-close" data-close-result aria-label="Đóng">×</button>
             <h3 id="result-title">{escape(title)}</h3>
             {highlight_html}
@@ -1734,11 +2100,7 @@ def page_template(
     pickup_handoff_script = """
             const refreshPickupHandoff = async () => {
                 try {
-                    const response = await fetch("/api/pickup-handoff", { cache: "no-store" });
-                    if (!response.ok) {
-                        throw new Error(`HTTP ${response.status}`);
-                    }
-                    const payload = await response.json();
+                    const payload = await fetchJson("/api/pickup-handoff");
                     const handoffId = Number(payload.id || 0);
                     if (!payload.has_pending || !payload.redirect_url || !handoffId || handoffId === lastPickupHandoffId) {
                         return;
@@ -1756,7 +2118,12 @@ def page_template(
         (() => {
             const params = new URLSearchParams(window.location.search);
             const kioskModeRequested = params.has("_kiosk");
-            const kioskModeActive = kioskModeRequested || window.sessionStorage.getItem("smartlocker_kiosk_mode") === "1";
+            const kioskModeDisabled = params.has("_nokiosk");
+            const kioskModeDefault = """ + json.dumps(KIOSK_PERFORMANCE_DEFAULT) + """;
+            const kioskModeActive = !kioskModeDisabled && (kioskModeRequested || kioskModeDefault || window.sessionStorage.getItem("smartlocker_kiosk_mode") === "1");
+            if (kioskModeDisabled) {
+                window.sessionStorage.removeItem("smartlocker_kiosk_mode");
+            }
             if (kioskModeActive) {
                 window.sessionStorage.setItem("smartlocker_kiosk_mode", "1");
                 document.documentElement.classList.add("kiosk-performance");
@@ -1775,6 +2142,7 @@ def page_template(
             const liveClock = document.querySelector("[data-live-clock]");
             const liveDate = document.querySelector("[data-live-date]");
             const adminAlertHost = document.querySelector("[data-admin-alert-host]");
+            const doorEventHost = document.querySelector("[data-door-event-host]");
             const scrollControl = document.querySelector("[data-scroll-control]");
             const scrollTrack = document.querySelector("[data-scroll-track]");
             const scrollThumb = document.querySelector("[data-scroll-thumb]");
@@ -1783,6 +2151,7 @@ def page_template(
             const cameraModal = document.querySelector("[data-order-camera-modal]");
             const cameraVideo = document.querySelector("[data-order-camera-video]");
             const cameraStatus = document.querySelector("[data-order-camera-status]");
+            const cameraStatusPopup = document.querySelector("[data-order-camera-status-popup]");
             const cameraCountdown = document.querySelector("[data-order-camera-countdown]");
             const cameraCaptureButton = document.querySelector("[data-capture-order-photo]");
             const cameraOpenButton = document.querySelector("[data-open-order-camera]");
@@ -1800,16 +2169,145 @@ def page_template(
             let scrollDragStartTop = 0;
             let cameraStream = null;
             let cameraCountdownTimer = null;
+            let cameraOpenAttemptId = 0;
             let lastAdminAlertId = Number(window.sessionStorage.getItem("smartlocker_admin_alert_id") || 0);
             let lastPickupHandoffId = Number(window.sessionStorage.getItem("smartlocker_pickup_handoff_id") || 0);
+            let lastDoorEventSequence = Number(window.sessionStorage.getItem("smartlocker_door_event_sequence") || 0);
             let scrollControlFrame = 0;
             const liveClockOptions = kioskModeActive
                 ? { hour: "2-digit", minute: "2-digit" }
                 : { hour: "2-digit", minute: "2-digit", second: "2-digit" };
             const liveClockIntervalMs = kioskModeActive ? 30000 : 1000;
-            const pickupHandoffPollIntervalMs = kioskModeActive ? 5000 : 2000;
-            const adminCommandPollIntervalMs = kioskModeActive ? 7000 : 3000;
+            const pickupHandoffPollIntervalMs = kioskModeActive ? """ + str(KIOSK_PICKUP_HANDOFF_POLL_MS) + """ : 2500;
+            const adminCommandPollIntervalMs = kioskModeActive ? """ + str(KIOSK_ADMIN_COMMAND_POLL_MS) + """ : 4000;
+            const doorEventPollIntervalMs = kioskModeActive ? """ + str(KIOSK_DOOR_EVENT_POLL_MS) + """ : 1500;
+            const fetchTimeoutMs = kioskModeActive ? """ + str(KIOSK_FETCH_TIMEOUT_MS) + """ : 5000;
             const scrollBehavior = kioskModeActive ? "auto" : "smooth";
+
+            const fetchJson = async (url) => {
+                const controller = new AbortController();
+                const timeoutId = window.setTimeout(() => controller.abort(), fetchTimeoutMs);
+                try {
+                    const response = await fetch(url, { cache: "no-store", signal: controller.signal });
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+                    return await response.json();
+                } finally {
+                    window.clearTimeout(timeoutId);
+                }
+            };
+
+            const formatLockerList = (lockerIds) => lockerIds
+                .filter((lockerId, index, items) => lockerId && items.indexOf(lockerId) === index)
+                .sort((left, right) => left - right)
+                .map((lockerId) => `Tủ ${lockerId}`)
+                .join(", ");
+
+            const showDoorEventToast = (events) => {
+                if (!doorEventHost) return;
+                const validEvents = events
+                    .map((event) => ({
+                        lockerId: Number(event.locker_id || 0),
+                        eventName: String(event.event || ""),
+                    }))
+                    .filter((event) => event.lockerId && ["door_open", "door_closed"].includes(event.eventName));
+                if (!validEvents.length) return;
+
+                const openedLockers = validEvents
+                    .filter((event) => event.eventName === "door_open")
+                    .map((event) => event.lockerId);
+                const closedLockers = validEvents
+                    .filter((event) => event.eventName === "door_closed")
+                    .map((event) => event.lockerId);
+                const hasVisibleContextModal = Boolean(
+                    document.querySelector("[data-result-modal]") ||
+                    document.querySelector("[data-admin-alert]")
+                );
+                if (document.querySelector("[data-result-modal][data-suppress-door-events='true']")) {
+                    return;
+                }
+                if (!openedLockers.length && closedLockers.length && hasVisibleContextModal) {
+                    return;
+                }
+                const openedText = formatLockerList(openedLockers);
+                const closedText = formatLockerList(closedLockers);
+                const popupTone = openedLockers.length && closedLockers.length
+                    ? "mixed"
+                    : openedLockers.length ? "open" : "closed";
+                const titleText = openedText && closedText
+                    ? "Cập nhật cửa tủ"
+                    : openedText
+                        ? `${openedLockers.length > 1 ? "Các tủ" : openedText} đã mở`
+                        : `${closedLockers.length > 1 ? "Các tủ" : closedText} đã đóng`;
+
+                doorEventHost.replaceChildren();
+                const toast = document.createElement("section");
+                toast.className = `door-event-toast ${popupTone}`;
+                toast.setAttribute("role", "dialog");
+                toast.setAttribute("aria-modal", "false");
+
+                const title = document.createElement("strong");
+                title.textContent = titleText;
+
+                const detail = document.createElement("div");
+                detail.className = "door-event-detail";
+                if (openedText) {
+                    const openLine = document.createElement("span");
+                    openLine.textContent = `Đã mở: ${openedText}`;
+                    detail.appendChild(openLine);
+                }
+                if (closedText) {
+                    const closedLine = document.createElement("span");
+                    closedLine.textContent = `Đã đóng: ${closedText}`;
+                    detail.appendChild(closedLine);
+                }
+
+                const close = document.createElement("button");
+                close.type = "button";
+                close.className = "door-event-close";
+                close.setAttribute("aria-label", "Đóng thông báo");
+                close.textContent = "×";
+                close.addEventListener("click", () => doorEventHost.replaceChildren());
+
+                toast.appendChild(title);
+                toast.appendChild(detail);
+                toast.appendChild(close);
+                doorEventHost.appendChild(toast);
+                window.setTimeout(() => {
+                    if (doorEventHost.contains(toast)) {
+                        toast.remove();
+                    }
+                }, 8000);
+            };
+
+            const refreshDoorEvents = async () => {
+                if (document.visibilityState === "hidden") return;
+                try {
+                    const payload = await fetchJson(`/api/locker-door-events?after=${encodeURIComponent(lastDoorEventSequence)}`);
+                    const events = Array.isArray(payload.events) ? payload.events : [];
+                    const freshEvents = [];
+                    events.forEach((event) => {
+                        const sequence = Number(event.sequence || 0);
+                        if (sequence > lastDoorEventSequence) {
+                            lastDoorEventSequence = sequence;
+                            freshEvents.push(event);
+                        }
+                    });
+                    showDoorEventToast(freshEvents);
+                    if (lastDoorEventSequence) {
+                        window.sessionStorage.setItem("smartlocker_door_event_sequence", String(lastDoorEventSequence));
+                    }
+                } catch (error) {
+                    // Door notifications are helpful but should never interrupt kiosk use.
+                }
+            };
+
+            document.querySelectorAll("img").forEach((image) => {
+                image.loading = image.loading || "lazy";
+                image.decoding = image.decoding || "async";
+                image.draggable = false;
+            });
 
             const updateLiveTime = () => {
                 const now = new Date();
@@ -1886,6 +2384,7 @@ def page_template(
             }
 
             const stopOrderCamera = () => {
+                cameraOpenAttemptId += 1;
                 if (cameraCountdownTimer) {
                     window.clearInterval(cameraCountdownTimer);
                     cameraCountdownTimer = null;
@@ -1899,34 +2398,126 @@ def page_template(
                 if (cameraCaptureButton) cameraCaptureButton.disabled = false;
             };
 
+            const setOrderCameraStatus = (message, tone = "info", autoHide = true) => {
+                if (cameraStatus) cameraStatus.textContent = message;
+                if (!cameraStatusPopup) return;
+                cameraStatusPopup.textContent = message;
+                cameraStatusPopup.className = `order-camera-status-popup ${tone}`;
+                cameraStatusPopup.classList.add("visible");
+                window.clearTimeout(setOrderCameraStatus.hideTimer);
+                if (autoHide) {
+                    setOrderCameraStatus.hideTimer = window.setTimeout(() => {
+                        cameraStatusPopup.classList.remove("visible");
+                    }, 2600);
+                }
+            };
+            setOrderCameraStatus.hideTimer = 0;
+
             const closeOrderCamera = () => {
                 stopOrderCamera();
                 cameraModal?.classList.remove("visible");
                 cameraModal?.setAttribute("aria-hidden", "true");
+                cameraStatusPopup?.classList.remove("visible");
             };
 
             const openOrderCamera = async () => {
                 if (!cameraModal || !cameraVideo || !cameraStatus || !cameraCaptureButton) return;
+                const attemptId = ++cameraOpenAttemptId;
                 hideKeyboard();
                 cameraModal.classList.add("visible");
                 cameraModal.setAttribute("aria-hidden", "false");
-                cameraStatus.textContent = "Đang kết nối camera USB...";
+                setOrderCameraStatus("Đang kết nối camera USB...", "info", false);
                 cameraCaptureButton.disabled = true;
+                let cameraOpenTimeout = null;
 
                 try {
                     if (!navigator.mediaDevices?.getUserMedia) {
                         throw new Error("Trình duyệt không hỗ trợ truy cập camera.");
                     }
-                    cameraStream = await navigator.mediaDevices.getUserMedia({
-                        video: { width: { ideal: 1280 }, height: { ideal: 720 } },
-                        audio: false,
-                    });
+                    const baseVideoConstraints = kioskModeActive
+                        ? { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 12, max: 18 } }
+                        : { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 24, max: 30 } };
+                    const cameraDevices = navigator.mediaDevices.enumerateDevices
+                        ? await navigator.mediaDevices.enumerateDevices()
+                        : [];
+                    const usbCamera = cameraDevices
+                        .filter((device) => device.kind === "videoinput")
+                        .find((device) => /usb|uvc|camera|webcam/i.test(device.label || ""));
+                    const cameraAttempts = [];
+                    if (usbCamera?.deviceId) {
+                        cameraAttempts.push({
+                            ...baseVideoConstraints,
+                            deviceId: { exact: usbCamera.deviceId },
+                        });
+                    }
+                    cameraAttempts.push(baseVideoConstraints);
+                    cameraAttempts.push(true);
+
+                    let lastCameraError = null;
+                    for (const videoConstraints of cameraAttempts) {
+                        if (attemptId !== cameraOpenAttemptId) {
+                            throw new Error("Phiên mở camera đã bị hủy.");
+                        }
+                        try {
+                            if (cameraOpenTimeout) {
+                                window.clearTimeout(cameraOpenTimeout);
+                                cameraOpenTimeout = null;
+                            }
+                            let cameraAttemptTimedOut = false;
+                            const openCamera = navigator.mediaDevices.getUserMedia({
+                                video: videoConstraints,
+                                audio: false,
+                            }).then((stream) => {
+                                if (cameraAttemptTimedOut || attemptId !== cameraOpenAttemptId) {
+                                    stream.getTracks().forEach((track) => track.stop());
+                                    throw new Error("Phiên mở camera đã bị hủy.");
+                                }
+                                return stream;
+                            });
+                            const timeout = new Promise((_, reject) => {
+                                cameraOpenTimeout = window.setTimeout(() => {
+                                    cameraAttemptTimedOut = true;
+                                    reject(new Error("Quá thời gian chờ camera phản hồi."));
+                                }, 8000);
+                            });
+                            cameraStream = await Promise.race([openCamera, timeout]);
+                            break;
+                        } catch (openError) {
+                            lastCameraError = openError;
+                            if (cameraStream) {
+                                cameraStream.getTracks().forEach((track) => track.stop());
+                                cameraStream = null;
+                            }
+                        }
+                    }
+                    if (cameraOpenTimeout) {
+                        window.clearTimeout(cameraOpenTimeout);
+                        cameraOpenTimeout = null;
+                    }
+                    if (!cameraStream) {
+                        throw lastCameraError || new Error("Không mở được camera.");
+                    }
                     cameraVideo.srcObject = cameraStream;
                     await cameraVideo.play();
-                    cameraStatus.textContent = "Camera đã sẵn sàng. Nhấn nút bên dưới để chụp sau 5 giây.";
+                    setOrderCameraStatus("Camera đã sẵn sàng. Nhấn nút bên dưới để chụp sau 5 giây.", "success");
                     cameraCaptureButton.disabled = false;
                 } catch (error) {
-                    cameraStatus.textContent = `Không mở được camera: ${error?.message || "hãy kiểm tra kết nối và quyền camera."}`;
+                    if (cameraOpenTimeout) window.clearTimeout(cameraOpenTimeout);
+                    if (cameraStream) {
+                        cameraStream.getTracks().forEach((track) => track.stop());
+                        cameraStream = null;
+                    }
+                    const errorName = error?.name || "";
+                    let message = error?.message || "hãy kiểm tra kết nối và quyền camera.";
+                    if (errorName === "NotAllowedError" || errorName === "SecurityError") {
+                        message = "trình duyệt chưa được cấp quyền camera.";
+                    } else if (errorName === "NotFoundError" || errorName === "OverconstrainedError") {
+                        message = "không tìm thấy camera USB phù hợp.";
+                    } else if (errorName === "NotReadableError" || errorName === "AbortError") {
+                        message = "camera đang bận hoặc driver không trả hình.";
+                    }
+                    setOrderCameraStatus(`Không mở được camera: ${message}`, "error", false);
+                    cameraCaptureButton.disabled = true;
                 }
             };
 
@@ -1935,13 +2526,13 @@ def page_template(
                 const sourceWidth = cameraVideo.videoWidth;
                 const sourceHeight = cameraVideo.videoHeight;
                 if (!sourceWidth || !sourceHeight) {
-                    if (cameraStatus) cameraStatus.textContent = "Camera chưa có hình ảnh. Vui lòng thử lại.";
+                    setOrderCameraStatus("Camera chưa có hình ảnh. Vui lòng thử lại.", "error", false);
                     if (cameraCaptureButton) cameraCaptureButton.disabled = false;
                     return;
                 }
 
-                const targetMaxWidth = kioskModeActive ? 960 : 1280;
-                const jpegQuality = kioskModeActive ? 0.74 : 0.86;
+                const targetMaxWidth = kioskModeActive ? 800 : 1280;
+                const jpegQuality = kioskModeActive ? 0.68 : 0.86;
                 const scale = Math.min(1, targetMaxWidth / sourceWidth);
                 const canvas = document.createElement("canvas");
                 canvas.width = Math.round(sourceWidth * scale);
@@ -1965,7 +2556,7 @@ def page_template(
                 cameraCaptureButton.disabled = true;
                 cameraCountdown.textContent = String(secondsLeft);
                 cameraCountdown.classList.remove("is-hidden");
-                if (cameraStatus) cameraStatus.textContent = "Giữ đơn hàng trước camera...";
+                setOrderCameraStatus("Giữ đơn hàng trước camera...", "info");
                 cameraCountdownTimer = window.setInterval(() => {
                     secondsLeft -= 1;
                     cameraCountdown.textContent = String(Math.max(0, secondsLeft));
@@ -2271,11 +2862,7 @@ def page_template(
             const refreshAdminCommand = async () => {
                 if (document.visibilityState === "hidden") return;
                 try {
-                    const response = await fetch("/api/admin-command", { cache: "no-store" });
-                    if (!response.ok) {
-                        throw new Error(`HTTP ${response.status}`);
-                    }
-                    const payload = await response.json();
+                    const payload = await fetchJson("/api/admin-command");
                     if (adminAlertHost) {
                         const commandId = Number(payload.id || 0);
                         const shouldShowModal = Boolean(payload.has_pending && payload.modal_html && commandId && commandId !== lastAdminAlertId);
@@ -2292,17 +2879,37 @@ def page_template(
             };
 """ if enable_admin_command_polling else "") + """
 """ + pickup_handoff_script + """
+            const scheduleDoorEventRefresh = () => {
+                window.setTimeout(async () => {
+                    await refreshDoorEvents();
+                    scheduleDoorEventRefresh();
+                }, doorEventPollIntervalMs);
+            };
+            refreshDoorEvents();
+            scheduleDoorEventRefresh();
 """ + ("""
+            const scheduleAdminCommandRefresh = () => {
+                window.setTimeout(async () => {
+                    await refreshAdminCommand();
+                    scheduleAdminCommandRefresh();
+                }, adminCommandPollIntervalMs);
+            };
             refreshAdminCommand();
-            window.setInterval(refreshAdminCommand, adminCommandPollIntervalMs);
+            scheduleAdminCommandRefresh();
 """ if enable_admin_command_polling else "") + """
 """ + ("""
             const refreshPickupHandoffWithVisibility = async () => {
                 if (document.visibilityState === "hidden") return;
                 await refreshPickupHandoff();
             };
+            const schedulePickupHandoffRefresh = () => {
+                window.setTimeout(async () => {
+                    await refreshPickupHandoffWithVisibility();
+                    schedulePickupHandoffRefresh();
+                }, pickupHandoffPollIntervalMs);
+            };
             refreshPickupHandoffWithVisibility();
-            window.setInterval(refreshPickupHandoffWithVisibility, pickupHandoffPollIntervalMs);
+            schedulePickupHandoffRefresh();
 """ if enable_pickup_handoff_polling else "") + """
         })();
     </script>
@@ -2374,6 +2981,13 @@ def page_template(
 
             .kiosk-performance * {{
                 animation: none !important;
+            }}
+
+            .kiosk-performance *,
+            .kiosk-performance *::before,
+            .kiosk-performance *::after {{
+                transition: none !important;
+                scroll-behavior: auto !important;
             }}
 
             .kiosk-scroll-control {{
@@ -2504,6 +3118,11 @@ def page_template(
                 text-align: center;
             }}
 
+            .kiosk-performance .admin-alert {{
+                box-shadow: none;
+                background: #fff3f3;
+            }}
+
             .admin-alert-badge {{
                 display: inline-block;
                 padding: 10px 16px;
@@ -2527,6 +3146,82 @@ def page_template(
 
             .admin-alert-note {{
                 font-weight: 700;
+            }}
+
+            .door-event-toast-host {{
+                position: fixed;
+                z-index: 95;
+                inset: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 24px;
+                pointer-events: none;
+            }}
+
+            .door-event-toast {{
+                position: relative;
+                display: grid;
+                gap: 12px;
+                width: min(720px, 100%);
+                min-height: 230px;
+                align-content: center;
+                padding: 34px 30px;
+                border-radius: 26px;
+                background: #ffffff;
+                border: 4px solid rgba(20, 86, 170, 0.18);
+                color: #0b4fae;
+                box-shadow: 0 28px 70px rgba(10, 67, 138, 0.22);
+                text-align: center;
+                pointer-events: auto;
+            }}
+
+            .door-event-toast.open {{
+                border-color: rgba(34, 125, 215, 0.42);
+            }}
+
+            .door-event-toast.closed {{
+                border-color: rgba(21, 148, 71, 0.42);
+                color: #126b36;
+            }}
+
+            .door-event-toast.mixed {{
+                border-color: rgba(11, 79, 174, 0.34);
+            }}
+
+            .door-event-toast strong {{
+                font-size: clamp(2.1rem, 5vw, 3.4rem);
+                line-height: 1.05;
+            }}
+
+            .door-event-detail {{
+                display: grid;
+                gap: 8px;
+            }}
+
+            .door-event-detail span {{
+                color: var(--muted);
+                font-size: clamp(1.08rem, 2vw, 1.4rem);
+                line-height: 1.4;
+                word-break: break-word;
+            }}
+
+            .door-event-close {{
+                position: absolute;
+                top: 14px;
+                right: 14px;
+                width: 46px;
+                height: 46px;
+                border: 0;
+                border-radius: 999px;
+                background: #dcebff;
+                color: #0b4fae;
+                font-size: 1.7rem;
+                cursor: pointer;
+            }}
+
+            .kiosk-performance .door-event-toast {{
+                box-shadow: none;
             }}
 
             .brand-chip, .clock-card {{
@@ -2617,6 +3312,14 @@ def page_template(
                 box-shadow: var(--shadow);
                 border-radius: 22px;
                 padding: 18px;
+            }}
+
+            .kiosk-performance .panel,
+            .kiosk-performance .table-wrap,
+            .kiosk-performance .info-list,
+            .kiosk-performance .button-grid {{
+                content-visibility: auto;
+                contain-intrinsic-size: 1px 420px;
             }}
 
             .button-grid {{
@@ -3050,6 +3753,9 @@ def page_template(
             .order-camera-field {{
                 display: grid;
                 gap: 10px;
+                order: -1;
+                position: relative;
+                z-index: 1;
             }}
 
             .order-camera-label {{
@@ -3164,6 +3870,11 @@ def page_template(
                 min-height: 360px;
                 border-radius: 20px;
                 background: #071529;
+                contain: paint;
+            }}
+
+            .kiosk-performance .order-camera-view {{
+                min-height: min(320px, 42vh);
             }}
 
             .order-camera-view video {{
@@ -3171,6 +3882,11 @@ def page_template(
                 width: 100%;
                 height: min(58vh, 540px);
                 object-fit: contain;
+                background: #071529;
+            }}
+
+            .kiosk-performance .order-camera-view video {{
+                height: min(42vh, 420px);
             }}
 
             .order-camera-countdown {{
@@ -3186,6 +3902,46 @@ def page_template(
                 text-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
             }}
 
+            .order-camera-status-popup {{
+                position: fixed;
+                top: 50%;
+                left: 50%;
+                z-index: 190;
+                width: min(520px, calc(100vw - 40px));
+                padding: 18px 22px;
+                border-radius: 18px;
+                background: #ffffff;
+                color: #12345d;
+                box-shadow: 0 22px 56px rgba(0, 0, 0, 0.38);
+                font-size: 1.12rem;
+                font-weight: 850;
+                line-height: 1.35;
+                text-align: center;
+                opacity: 0;
+                pointer-events: none;
+                transform: translate(-50%, -50%) scale(0.96);
+                transition: opacity 160ms ease, transform 160ms ease;
+            }}
+
+            .order-camera-status-popup.visible {{
+                opacity: 1;
+                transform: translate(-50%, -50%) scale(1);
+            }}
+
+            .order-camera-status-popup.info {{
+                border: 2px solid rgba(11, 79, 174, 0.24);
+            }}
+
+            .order-camera-status-popup.success {{
+                border: 2px solid rgba(21, 148, 71, 0.28);
+                color: #126b36;
+            }}
+
+            .order-camera-status-popup.error {{
+                border: 2px solid rgba(178, 34, 34, 0.28);
+                color: #9f1f1f;
+            }}
+
             .order-camera-dialog > p {{
                 margin: 14px 0;
                 text-align: center;
@@ -3196,6 +3952,11 @@ def page_template(
                 display: grid;
                 grid-template-columns: repeat(2, minmax(0, 1fr));
                 gap: 12px;
+                position: sticky;
+                bottom: 0;
+                padding-top: 12px;
+                background: #ffffff;
+                z-index: 1;
             }}
 
             label {{
@@ -3313,9 +4074,9 @@ def page_template(
 
             .result-modal {{
                 position: relative;
-                width: min(760px, 100%);
+                width: min(920px, 100%);
                 border-radius: 28px;
-                padding: 28px 26px 24px;
+                padding: 34px 32px 28px;
                 background: linear-gradient(180deg, rgba(255, 255, 255, 1), rgba(242, 248, 255, 0.98));
                 box-shadow: 0 24px 60px rgba(10, 67, 138, 0.12);
                 color: #0b4fae;
@@ -3331,7 +4092,7 @@ def page_template(
 
             .result-modal h3 {{
                 margin: 0 40px 18px 0;
-                font-size: clamp(1.6rem, 3vw, 2.3rem);
+                font-size: clamp(2rem, 4vw, 3rem);
             }}
 
             .result-highlight-grid {{
@@ -3363,7 +4124,7 @@ def page_template(
 
             .result-highlight-value {{
                 display: block;
-                font-size: clamp(1.8rem, 4vw, 2.7rem);
+                font-size: clamp(2.2rem, 5vw, 3.5rem);
                 letter-spacing: 0.04em;
             }}
 
@@ -3400,6 +4161,39 @@ def page_template(
                 font-size: 1.15rem;
                 font-weight: 800;
                 cursor: pointer;
+            }}
+
+            .result-modal.compact {{
+                width: min(680px, 100%);
+                padding: 26px 24px 22px;
+            }}
+
+            .result-modal.compact h3 {{
+                font-size: clamp(1.5rem, 3vw, 2.1rem);
+                margin-bottom: 14px;
+            }}
+
+            .result-modal.compact .result-highlight-grid {{
+                grid-template-columns: minmax(0, 1fr);
+                margin-bottom: 12px;
+            }}
+
+            .result-modal.compact .result-highlight-card {{
+                padding: 14px;
+            }}
+
+            .result-modal.compact .result-highlight-value {{
+                font-size: clamp(1.8rem, 4vw, 2.7rem);
+            }}
+
+            .result-modal.compact ul {{
+                font-size: 0.98rem;
+                line-height: 1.45;
+            }}
+
+            .result-modal.compact .result-modal-button {{
+                margin-top: 14px;
+                padding: 14px;
             }}
 
             .result-qr-block {{
@@ -3699,6 +4493,11 @@ def page_template(
                 background: #ffffff;
                 color: #0b4fae;
                 cursor: pointer;
+            }}
+
+            .kiosk-performance .key,
+            .kiosk-performance .keyboard-grid-numeric .key {{
+                box-shadow: none;
             }}
 
             .key.backspace-key {{
@@ -4069,6 +4868,15 @@ def page_template(
                     border-radius: 24px;
                 }}
 
+                .door-event-toast-host {{
+                    padding: 16px;
+                }}
+
+                .door-event-toast {{
+                    min-height: 200px;
+                    padding: 30px 18px 24px;
+                }}
+
                 .page.with-keyboard {{
                     padding-bottom: calc(24px + var(--keyboard-space));
                 }}
@@ -4179,6 +4987,7 @@ def page_template(
             <button class="kiosk-scroll-button" type="button" data-scroll-down aria-label="Cuộn xuống">▼</button>
         </nav>
         <div data-admin-alert-host>{admin_modal_html}</div>
+        <div class="door-event-toast-host" data-door-event-host aria-live="polite" aria-atomic="false"></div>
         {keyboard}
         {page_script}
     </body>
@@ -4356,6 +5165,7 @@ def flow_page(
                     <video data-order-camera-video autoplay playsinline muted></video>
                     <div class="order-camera-countdown is-hidden" data-order-camera-countdown></div>
                 </div>
+                <div class="order-camera-status-popup" data-order-camera-status-popup role="status" aria-live="polite"></div>
                 <p data-order-camera-status>Nhấn “Bắt đầu chụp” để đếm ngược 5 giây.</p>
                 <div class="order-camera-actions">
                     <button class="submit-button secondary" type="button" data-close-order-camera>Hủy</button>
@@ -4877,6 +5687,13 @@ async def pickup_handoff_api() -> JSONResponse:
     return JSONResponse(consume_pickup_handoff())
 
 
+@app.get("/api/locker-door-events", response_class=JSONResponse)
+async def locker_door_events_api(after: int = 0) -> JSONResponse:
+    events = get_locker_door_events(max(0, after))
+    last_sequence = max([int(event["sequence"]) for event in events], default=max(0, after))
+    return JSONResponse({"last_sequence": last_sequence, "events": events})
+
+
 @app.get("/qr/pickup-code/{pickup_code}.svg")
 async def pickup_code_qr(pickup_code: str) -> Response:
     if not qrcode_available():
@@ -4982,6 +5799,7 @@ async def shipper_dropoff(
     order_photo_data: str = Form(""),
 ) -> HTMLResponse:
     door_closed_confirmed = False
+    pause_locker_light_sync()
     try:
         cleaned_phone = normalize_phone(phone)
         recipient = get_registered_user(cleaned_phone)
@@ -5000,7 +5818,7 @@ async def shipper_dropoff(
             release_record(record)
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         photo_path: Path | None = None
-        photo_note = "Đơn hàng chưa có ảnh chụp."
+        photo_note = ""
         if order_photo_data.strip():
             try:
                 photo_path = save_order_photo(
@@ -5010,10 +5828,10 @@ async def shipper_dropoff(
                     record.pickup_code,
                 )
                 if photo_path is not None:
-                    photo_note = f"Đã lưu ảnh đơn hàng: {photo_path.name}"
+                    photo_note = "Đã lưu ảnh đơn hàng."
             except (OrderPhotoError, OSError) as exc:
                 photo_note = f"Đơn đã lưu nhưng ảnh chụp chưa lưu được: {exc}"
-        token_note = "Người nhận chưa đăng ký email nên hiện chỉ có mã dự phòng tại kiosk."
+        token_note = "Khách chưa đăng ký email."
         if recipient is not None:
             record, token_note = queue_pickup_email_delivery(
                 record,
@@ -5021,14 +5839,18 @@ async def shipper_dropoff(
                 request,
                 order_photo_path=photo_path,
             )
+            if record.email_delivery_status == "sent":
+                token_note = "Đã gửi link nhận hàng qua email."
+            elif record.email_delivery_status == "pending":
+                token_note = "Email đang chờ gửi."
+            elif record.email_delivery_status == "failed":
+                token_note = "Chưa gửi được email."
         result_html = result_panel(
             "Tủ đã khóa",
             [
-                f"Tủ {record.locker_id} đã khóa. Đèn báo đã bật.",
-                f"Vị trí tủ đã mở: Tủ {record.locker_id}",
-                f"Mã mở tủ tại kiosk: {record.pickup_code}",
+                "Cửa đã đóng. Đèn báo đã bật.",
                 f"Mã đơn hàng: {record.order_code or '---'}",
-                photo_note,
+                *([photo_note] if photo_note else []),
                 token_note,
             ],
             highlights=[
@@ -5043,14 +5865,12 @@ async def shipper_dropoff(
     except OSError as exc:
         if 'record' in locals() and recipient is not None:
             record = update_record_email_delivery(record, recipient.email, "failed", str(exc))
-        closed_notice = [f"Tủ {record.locker_id} đã khóa. Đèn báo đã bật."] if door_closed_confirmed else []
+        closed_notice = ["Cửa đã đóng. Đèn báo đã bật."] if door_closed_confirmed else []
         result_html = result_panel(
             "Tủ đã khóa nhưng chưa gửi được email",
             closed_notice + [
-                f"Vị trí tủ đã mở: Tủ {record.locker_id}" if 'record' in locals() else "Tủ đã được mở để lưu hàng.",
-                f"Mã mở tủ tại kiosk: {record.pickup_code}" if 'record' in locals() else "Vui lòng kiểm tra lại mã mở tủ tại kiosk.",
                 f"Mã đơn hàng: {record.order_code or '---'}" if 'record' in locals() else "Đơn hàng đã được lưu.",
-                str(exc),
+                "Khách có thể dùng mã mở tủ trên màn hình.",
             ],
             highlights=[
                 ("Vị trí tủ", f"Tủ {record.locker_id}"),
@@ -5060,6 +5880,8 @@ async def shipper_dropoff(
             redirect_url="/",
             redirect_delay_ms=DROPOFF_RESULT_DISPLAY_MS if door_closed_confirmed else 2500,
         )
+    finally:
+        resume_locker_light_sync()
 
     return HTMLResponse(
         flow_page(
@@ -5104,17 +5926,16 @@ async def receiver_pickup(phone: str = Form(...), pickup_code: str = Form(...)) 
         record = collect_record(cleaned_phone, cleaned_code)
         mark_locker_empty(record.locker_id)
         result_html = result_panel(
-            "Mở tủ thành công",
+            "Mở tủ",
             [
-                f"Tủ vừa mở: Tủ {record.locker_id}",
-                "Người nhận có thể lấy đồ và đóng cửa tủ lại.",
-                "Hệ thống đã giải phóng tủ để dùng cho đơn tiếp theo.",
+                "Lấy hàng rồi đóng cửa tủ.",
             ],
             highlights=[
-                ("Tủ đã mở", f"Tủ {record.locker_id}"),
-                ("Mã xác nhận", record.pickup_code),
+                ("Tủ", f"Tủ {record.locker_id}"),
             ],
             redirect_url="/",
+            suppress_door_events=True,
+            compact=True,
         )
     except (HTTPException, LockerHardwareError) as exc:
         result_html = result_panel("Không thể mở tủ", [user_error_message(exc)], tone="error")
@@ -5249,17 +6070,16 @@ async def pickup_code_open(pickup_code: str, phone_last4: str = Form(...)) -> HT
         record = collect_record_by_last4(cleaned_code, normalize_phone_last4(phone_last4))
         mark_locker_empty(record.locker_id)
         result_html = result_panel(
-            "Mở tủ thành công",
+            "Mở tủ",
             [
-                f"Tủ vừa mở: Tủ {record.locker_id}",
-                "Người nhận có thể lấy đồ và đóng cửa tủ lại.",
-                "Mã mở tủ này đã được khóa lại để tránh bị dùng lặp.",
+                "Lấy hàng rồi đóng cửa tủ.",
             ],
             highlights=[
-                ("Tủ đã mở", f"Tủ {record.locker_id}"),
-                ("Xác thực", "Đã kiểm tra 4 số cuối"),
+                ("Tủ", f"Tủ {record.locker_id}"),
             ],
             redirect_url="/",
+            suppress_door_events=True,
+            compact=True,
         )
         return HTMLResponse(pickup_code_page(cleaned_code, preview_record.locker_id, result_html))
     except (HTTPException, LockerHardwareError) as exc:
@@ -5299,17 +6119,16 @@ async def pickup_link_open(request: Request, raw_token: str, phone_last4: str = 
         record = mark_pickup_access_used(raw_token, normalize_phone_last4(phone_last4))
         mark_locker_empty(record.locker_id)
         result_html = result_panel(
-            "Mở tủ thành công",
+            "Mở tủ",
             [
-                f"Tủ vừa mở: Tủ {record.locker_id}",
-                "Người nhận có thể lấy đồ và đóng cửa tủ lại.",
-                "Link này đã được khóa lại để tránh bị dùng lặp.",
+                "Lấy hàng rồi đóng cửa tủ.",
             ],
             highlights=[
-                ("Tủ đã mở", f"Tủ {record.locker_id}"),
-                ("Xác thực", "Đã kiểm tra 4 số cuối"),
+                ("Tủ", f"Tủ {record.locker_id}"),
             ],
             redirect_url="/",
+            suppress_door_events=True,
+            compact=True,
         )
         return HTMLResponse(
             pickup_link_page(

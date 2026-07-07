@@ -147,7 +147,7 @@ class AdminCommand(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     action: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", index=True)
-    note: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    note: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.now, index=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 

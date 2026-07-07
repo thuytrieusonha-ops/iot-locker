@@ -26,7 +26,7 @@ EVENT_TYPES = (
     "issue_report",
 )
 LABELS = ("parcel", "oversized", "damaged", "unknown")
-MODEL_NAMES = ("yolov8n", "yolov8s", "parcel-tracker-v1")
+MODEL_NAMES = ("lightweight-parcel-check", "manual-review-helper")
 
 
 def parse_args() -> argparse.Namespace:

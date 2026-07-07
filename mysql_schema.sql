@@ -152,7 +152,7 @@ CREATE TABLE IF NOT EXISTS admin_commands (
     id INT NOT NULL AUTO_INCREMENT,
     action VARCHAR(64) NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'pending',
-    note VARCHAR(255) NULL,
+    note VARCHAR(1024) NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at DATETIME NULL,
     PRIMARY KEY (id),

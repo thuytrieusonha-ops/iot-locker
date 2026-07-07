@@ -70,6 +70,16 @@ class MqttLockerControllerTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(self.actions, ["open:1", "used:1"])
 
+    def test_door_events_are_available_for_ui_notifications(self) -> None:
+        self.publish_door_event(2, "door_open")
+        self.publish_door_event(2, "door_closed")
+
+        events = self.controller.door_events_after(0)
+
+        self.assertEqual([event["event"] for event in events], ["door_open", "door_closed"])
+        self.assertEqual([event["locker_id"] for event in events], [2, 2])
+        self.assertEqual(self.controller.door_events_after(int(events[0]["sequence"])), [events[1]])
+
     def test_occupied_state_is_retained_for_gateway_restart(self) -> None:
         mqtt_client = FakeMqttClient()
         self.controller._client = mqtt_client

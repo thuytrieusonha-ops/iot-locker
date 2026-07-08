@@ -171,3 +171,17 @@ class AdminCommandLocker(Base):
 
     command: Mapped[AdminCommand] = relationship(back_populates="locker_links")
     locker: Mapped[Locker] = relationship(back_populates="admin_command_links")
+
+
+class AdminLoginEvent(Base):
+    __tablename__ = "admin_login_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    username: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    client_host: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    device_label: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    session_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    note: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.now, index=True)

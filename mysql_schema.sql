@@ -177,3 +177,21 @@ CREATE TABLE IF NOT EXISTS admin_command_lockers (
         ON DELETE RESTRICT
         ON UPDATE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS admin_login_events (
+    id INT NOT NULL AUTO_INCREMENT,
+    event_type VARCHAR(40) NOT NULL,
+    username VARCHAR(120) NULL,
+    client_host VARCHAR(80) NULL,
+    device_label VARCHAR(120) NULL,
+    user_agent VARCHAR(255) NULL,
+    session_id VARCHAR(32) NULL,
+    note VARCHAR(255) NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    KEY ix_admin_login_events_event_type (event_type),
+    KEY ix_admin_login_events_username (username),
+    KEY ix_admin_login_events_client_host (client_host),
+    KEY ix_admin_login_events_session_id (session_id),
+    KEY ix_admin_login_events_created_at (created_at)
+);

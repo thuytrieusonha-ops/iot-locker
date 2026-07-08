@@ -13,12 +13,13 @@ from urllib.parse import urlsplit, urlunsplit
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy import delete, desc, select, text, update
+from sqlalchemy.exc import SQLAlchemyError
 
 from config import build_local_url, env_int, env_str
 from database import SessionLocal, init_db, is_database_configured
 from locker_hardware import LockerHardwareError, mark_locker_empty
 from main import retry_email_delivery_for_phone
-from model import AdminCommand, AdminCommandLocker, Locker, LockerAccessToken, LockerOrder, UserAccount
+from model import AdminCommand, AdminCommandLocker, AdminLoginEvent, Locker, LockerAccessToken, LockerOrder, UserAccount
 
 LOCKER_COUNT = max(1, env_int("SMARTLOCKER_LOCKER_COUNT", 8))
 MONITOR_HOST = env_str("SMARTLOCKER_MONITOR_HOST", "0.0.0.0") or "0.0.0.0"
@@ -179,6 +180,60 @@ def ensure_database() -> None:
         raise HTTPException(status_code=500, detail="Chưa cấu hình SMARTLOCKER_DATABASE_URL.")
 
 
+def request_client_host(request: Request) -> str:
+    for header_name in ("cf-connecting-ip", "x-real-ip", "x-forwarded-for"):
+        header_value = request.headers.get(header_name, "").strip()
+        if header_value:
+            return header_value.split(",", 1)[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def summarize_user_agent(user_agent: str) -> str:
+    value = user_agent.strip()
+    if not value:
+        return "Thiết bị không rõ"
+
+    lowered = value.lower()
+    if "iphone" in lowered:
+        device = "iPhone"
+    elif "ipad" in lowered:
+        device = "iPad"
+    elif "android" in lowered:
+        device = "Android"
+    elif "windows" in lowered:
+        device = "Windows"
+    elif "macintosh" in lowered or "mac os" in lowered:
+        device = "macOS"
+    elif "linux" in lowered:
+        device = "Linux"
+    else:
+        device = "Thiết bị không rõ"
+
+    if "edg/" in lowered:
+        browser = "Edge"
+    elif "opr/" in lowered or "opera" in lowered:
+        browser = "Opera"
+    elif "firefox/" in lowered:
+        browser = "Firefox"
+    elif "chrome/" in lowered or "chromium/" in lowered:
+        browser = "Chrome"
+    elif "safari/" in lowered:
+        browser = "Safari"
+    else:
+        browser = "Trình duyệt không rõ"
+
+    return f"{browser} trên {device}"
+
+
+def admin_request_metadata(request: Request) -> dict[str, str]:
+    user_agent = request.headers.get("user-agent", "").strip()
+    return {
+        "client_host": request_client_host(request),
+        "user_agent": user_agent[:255],
+        "device_label": summarize_user_agent(user_agent),
+    }
+
+
 def cleanup_admin_sessions() -> None:
     now = datetime.now()
     expired: list[str] = []
@@ -193,13 +248,21 @@ def cleanup_admin_sessions() -> None:
         admin_sessions.pop(token, None)
 
 
-def create_admin_session() -> str:
+def create_admin_session(request: Request, username: str) -> str:
     cleanup_admin_sessions()
     session_token = secrets.token_urlsafe(32)
+    now = datetime.now()
+    expires_at = now + timedelta(hours=SESSION_TTL_HOURS)
+    session_id = secrets.token_urlsafe(6)
+    metadata = admin_request_metadata(request)
     admin_sessions.clear()
     admin_sessions[session_token] = {
-        "expires_at": datetime.now() + timedelta(hours=SESSION_TTL_HOURS),
+        "created_at": now,
+        "expires_at": expires_at,
         "csrf_token": secrets.token_urlsafe(32),
+        "username": username.strip(),
+        "session_id": session_id,
+        **metadata,
     }
     return session_token
 
@@ -254,6 +317,82 @@ def has_active_admin_session(exclude_token: str = "") -> bool:
         if isinstance(expires_at, datetime) and expires_at > datetime.now():
             return True
     return False
+
+
+def active_admin_session_cards(exclude_token: str = "") -> list[dict[str, str]]:
+    cleanup_admin_sessions()
+    cards: list[dict[str, str]] = []
+    for token, session_data in admin_sessions.items():
+        if token == exclude_token or not isinstance(session_data, dict):
+            continue
+        expires_at = session_data.get("expires_at")
+        if not isinstance(expires_at, datetime) or expires_at <= datetime.now():
+            continue
+        created_at = session_data.get("created_at")
+        cards.append(
+            {
+                "session_id": str(session_data.get("session_id") or token[:8]),
+                "username": str(session_data.get("username") or ADMIN_USERNAME or "---"),
+                "client_host": str(session_data.get("client_host") or "unknown"),
+                "device_label": str(session_data.get("device_label") or "Thiết bị không rõ"),
+                "created_at": now_text(created_at) if isinstance(created_at, datetime) else "---",
+                "expires_at": now_text(expires_at),
+            }
+        )
+    return cards
+
+
+def log_admin_login_event(
+    event_type: str,
+    request: Request,
+    username: str = "",
+    session_data: dict[str, object] | None = None,
+    note: str = "",
+) -> None:
+    metadata = admin_request_metadata(request)
+    if session_data:
+        metadata["client_host"] = str(session_data.get("client_host") or metadata["client_host"])
+        metadata["device_label"] = str(session_data.get("device_label") or metadata["device_label"])
+        metadata["user_agent"] = str(session_data.get("user_agent") or metadata["user_agent"])[:255]
+    event = AdminLoginEvent(
+        event_type=event_type,
+        username=(username.strip() or str(session_data.get("username") if session_data else "") or None),
+        client_host=metadata["client_host"],
+        device_label=metadata["device_label"],
+        user_agent=metadata["user_agent"],
+        session_id=str(session_data.get("session_id") or "")[:32] if session_data else None,
+        note=note[:255] if note else None,
+        created_at=datetime.now(),
+    )
+
+    if not is_database_configured() or SessionLocal is None:
+        print(
+            "[smartlocker] Admin login event "
+            f"{event_type}: user={event.username or '---'} ip={event.client_host or '---'} "
+            f"device={event.device_label or '---'} note={note or '---'}"
+        )
+        return
+
+    try:
+        with SessionLocal() as session:
+            session.add(event)
+            session.commit()
+    except SQLAlchemyError as exc:
+        print(f"[smartlocker] Admin login event warning: could not write audit log: {exc}")
+
+
+def fetch_admin_login_events(limit: int = 12) -> list[AdminLoginEvent]:
+    if not is_database_configured() or SessionLocal is None:
+        return []
+
+    try:
+        with SessionLocal() as session:
+            return session.scalars(
+                select(AdminLoginEvent).order_by(desc(AdminLoginEvent.created_at)).limit(limit)
+            ).all()
+    except SQLAlchemyError as exc:
+        print(f"[smartlocker] Admin login event warning: could not read audit log: {exc}")
+        return []
 
 
 def cleanup_admin_login_attempts() -> None:
@@ -698,6 +837,125 @@ def issue_report_rows(reports: list[AdminCommand]) -> str:
             """
         )
     return "".join(rows)
+
+
+def admin_active_sessions_html(exclude_token: str = "") -> str:
+    sessions = active_admin_session_cards(exclude_token)
+    if not sessions:
+        return """
+        <section class="panel admin-session-panel">
+            <div class="section-head">
+                <div>
+                    <h2>Thiết bị đang đăng nhập</h2>
+                    <p>Chưa có phiên quản trị nào đang giữ khóa đăng nhập.</p>
+                </div>
+            </div>
+        </section>
+        """
+
+    cards = "".join(
+        f"""
+        <article class="admin-session-card">
+            <div>
+                <span>Phiên</span>
+                <strong>{escape(session_info["session_id"])}</strong>
+            </div>
+            <div>
+                <span>Thiết bị</span>
+                <strong>{escape(session_info["device_label"])}</strong>
+            </div>
+            <div>
+                <span>Địa chỉ</span>
+                <strong>{escape(session_info["client_host"])}</strong>
+            </div>
+            <div>
+                <span>Đăng nhập lúc</span>
+                <strong>{escape(session_info["created_at"])}</strong>
+            </div>
+            <div>
+                <span>Tự hết hạn</span>
+                <strong>{escape(session_info["expires_at"])}</strong>
+            </div>
+        </article>
+        """
+        for session_info in sessions
+    )
+    return f"""
+    <section class="panel admin-session-panel">
+        <div class="section-head">
+            <div>
+                <h2>Thiết bị đang đăng nhập</h2>
+                <p>Nếu quên đăng xuất, đối chiếu địa chỉ và thiết bị bên dưới để biết phiên nào đang giữ quyền quản trị.</p>
+            </div>
+        </div>
+        <div class="admin-session-grid">
+            {cards}
+        </div>
+    </section>
+    """
+
+
+def admin_login_event_rows(events: list[AdminLoginEvent]) -> str:
+    if not events:
+        return """
+        <tr>
+            <td colspan="6" class="empty-cell">Chưa có nhật ký đăng nhập trong database.</td>
+        </tr>
+        """
+
+    event_labels = {
+        "login_success": "Đăng nhập thành công",
+        "login_failed": "Sai thông tin",
+        "login_rate_limited": "Tạm khóa do sai nhiều",
+        "login_blocked_active_session": "Bị chặn do có phiên khác",
+        "logout": "Đăng xuất",
+    }
+    rows: list[str] = []
+    for event in events:
+        rows.append(
+            f"""
+            <tr>
+                <td>{escape(now_text(event.created_at))}</td>
+                <td>{escape(event_labels.get(event.event_type, event.event_type))}</td>
+                <td>{escape(event.username or "---")}</td>
+                <td>{escape(event.client_host or "---")}</td>
+                <td>{escape(event.device_label or "---")}</td>
+                <td>{escape(event.note or event.session_id or "---")}</td>
+            </tr>
+            """
+        )
+    return "".join(rows)
+
+
+def admin_login_events_html() -> str:
+    rows = admin_login_event_rows(fetch_admin_login_events())
+    return f"""
+    <section class="panel">
+        <div class="section-head">
+            <div>
+                <h2>Nhật ký đăng nhập gần đây</h2>
+                <p>Ghi lại các lần đăng nhập, đăng xuất, sai mật khẩu và phiên bị chặn để dễ truy vết.</p>
+            </div>
+        </div>
+        <div class="table-wrap admin-login-log">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Thời gian</th>
+                        <th>Sự kiện</th>
+                        <th>Tài khoản</th>
+                        <th>Địa chỉ</th>
+                        <th>Thiết bị</th>
+                        <th>Ghi chú</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows}
+                </tbody>
+            </table>
+        </div>
+    </section>
+    """
 
 
 def admin_pending_html(command: AdminCommand | None) -> str:
@@ -1214,6 +1472,40 @@ def page_shell(title: str, subtitle: str, content: str, script: str = "") -> str
             .admin-pending strong,
             .admin-pending span {{ display: block; }}
             .admin-pending span {{ margin-top: 6px; }}
+            .admin-session-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+                gap: 12px;
+            }}
+            .admin-session-card {{
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 10px;
+                border: 1px solid var(--line);
+                border-radius: 18px;
+                padding: 16px;
+                background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+            }}
+            .admin-session-card div:first-child {{
+                grid-column: 1 / -1;
+            }}
+            .admin-session-card span {{
+                display: block;
+                color: var(--muted);
+                font-size: 0.82rem;
+                font-weight: 700;
+                margin-bottom: 4px;
+            }}
+            .admin-session-card strong {{
+                display: block;
+                color: #0d3b66;
+                line-height: 1.35;
+                overflow-wrap: anywhere;
+                word-break: break-word;
+            }}
+            .admin-login-log table {{
+                min-width: 860px;
+            }}
             @media (max-width: 980px) {{
                 .grid-roles, .summary-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
                 .form-grid, .admin-grid, .admin-actions {{ grid-template-columns: 1fr; }}
@@ -1234,6 +1526,9 @@ def page_shell(title: str, subtitle: str, content: str, script: str = "") -> str
                     min-height: 70px;
                     border-radius: 14px;
                     padding: 10px 6px;
+                }}
+                .admin-session-card {{
+                    grid-template-columns: 1fr;
                 }}
                 .role-card {{
                     min-height: 220px;
@@ -1534,6 +1829,8 @@ def admin_login_page(result_html: str = "") -> str:
             </div>
         </form>
     </section>
+    {admin_active_sessions_html()}
+    {admin_login_events_html()}
     """
     script = """
     <script>
@@ -1701,6 +1998,8 @@ def admin_dashboard_page(csrf_token: str = "") -> str:
                 <strong id="summary-collected">{summary["collected"]}</strong>
             </article>
         </section>
+
+        {admin_active_sessions_html()}
 
         <section class="panel">
             <div class="section-head">
@@ -2110,16 +2409,26 @@ async def admin_login(request: Request, username: str = Form(...), password: str
     try:
         ensure_admin_login_allowed(scope)
     except HTTPException as exc:
+        log_admin_login_event("login_rate_limited", request, username, note=str(exc.detail))
         return HTMLResponse(admin_login_page(result_box("Tạm khóa đăng nhập", str(exc.detail), tone="error")))
 
     if has_active_admin_session():
+        log_admin_login_event(
+            "login_blocked_active_session",
+            request,
+            username,
+            note="Có phiên quản trị khác đang hoạt động.",
+        )
         return HTMLResponse(admin_login_page(result_box("Đang có phiên quản trị", ACTIVE_ADMIN_LOCK_MESSAGE, tone="error")))
 
     if not hmac.compare_digest(username.strip(), ADMIN_USERNAME) or not hmac.compare_digest(password, ADMIN_PASSWORD):
         record_admin_login_attempt(scope)
+        log_admin_login_event("login_failed", request, username, note="Tên đăng nhập hoặc mật khẩu không đúng.")
         return HTMLResponse(admin_login_page(result_box("Đăng nhập thất bại", "Tên đăng nhập hoặc mật khẩu không đúng.", tone="error")))
 
-    session_token = create_admin_session()
+    session_token = create_admin_session(request, username)
+    session_data = admin_sessions.get(session_token)
+    log_admin_login_event("login_success", request, username, session_data=session_data, note="Đăng nhập quản trị thành công.")
     clear_admin_login_attempts(scope)
     response = RedirectResponse(url="/admin/dashboard", status_code=303)
     response.set_cookie(
@@ -2138,6 +2447,8 @@ async def admin_login(request: Request, username: str = Form(...), password: str
 async def admin_logout(request: Request, csrf_token: str = Form("")) -> RedirectResponse:
     require_admin(request)
     require_admin_csrf(request, csrf_token)
+    session_data = get_admin_session(request)
+    log_admin_login_event("logout", request, session_data=session_data, note="Đăng xuất quản trị.")
     response = RedirectResponse(url="/admin", status_code=303)
     clear_admin_session(response, request)
     return response

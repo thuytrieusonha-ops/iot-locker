@@ -2155,9 +2155,14 @@ def page_template(
             const cameraCountdown = document.querySelector("[data-order-camera-countdown]");
             const cameraCaptureButton = document.querySelector("[data-capture-order-photo]");
             const cameraOpenButton = document.querySelector("[data-open-order-camera]");
+            const cameraFileInput = document.querySelector("[data-order-camera-file]");
             const cameraPhotoData = document.querySelector("[data-order-photo-data]");
             const cameraPreview = document.querySelector("[data-order-camera-preview]");
             const cameraPreviewImage = document.querySelector("[data-order-camera-preview-image]");
+            const qrScannerModal = document.querySelector("[data-qr-scanner-modal]");
+            const qrScannerVideo = document.querySelector("[data-qr-scanner-video]");
+            const qrScannerStatus = document.querySelector("[data-qr-scanner-status]");
+            const qrScannerButtons = Array.from(document.querySelectorAll("[data-open-qr-scanner]"));
             let activeField = null;
             let redirectTimer = null;
             let keyboardUppercase = false;
@@ -2165,11 +2170,18 @@ def page_template(
             let scannerLastKeyAt = 0;
             const scannerTarget = document.querySelector("[data-scanner-input='true']");
             const scannerMaxKeyGapMs = 120;
+            const pointerLooksMobile = window.matchMedia?.("(pointer: coarse)")?.matches;
+            const agentLooksMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "");
+            const nativeMobileInputActive = Boolean(pointerLooksMobile && agentLooksMobile);
             let scrollDragStartY = 0;
             let scrollDragStartTop = 0;
             let cameraStream = null;
             let cameraCountdownTimer = null;
             let cameraOpenAttemptId = 0;
+            let qrScannerStream = null;
+            let qrScannerFrame = 0;
+            let qrScannerDetector = null;
+            let qrScannerTarget = null;
             let lastAdminAlertId = Number(window.sessionStorage.getItem("smartlocker_admin_alert_id") || 0);
             let lastPickupHandoffId = Number(window.sessionStorage.getItem("smartlocker_pickup_handoff_id") || 0);
             let lastDoorEventSequence = Number(window.sessionStorage.getItem("smartlocker_door_event_sequence") || 0);
@@ -2420,7 +2432,60 @@ def page_template(
                 cameraStatusPopup?.classList.remove("visible");
             };
 
+            const isMobileCaptureDevice = () => {
+                return nativeMobileInputActive;
+            };
+
+            const storeOrderPhotoData = (photoData) => {
+                if (!cameraPhotoData || !cameraPreview || !cameraPreviewImage) return;
+                cameraPhotoData.value = photoData;
+                cameraPreviewImage.src = photoData;
+                cameraPreview.classList.remove("is-hidden");
+                if (cameraOpenButton) cameraOpenButton.textContent = "📷 Chụp lại ảnh đơn hàng";
+            };
+
+            const convertImageFileToJpegDataUrl = (file) => new Promise((resolve, reject) => {
+                if (!file || !file.type?.startsWith("image/")) {
+                    reject(new Error("Tệp đã chọn không phải ảnh."));
+                    return;
+                }
+                const imageUrl = URL.createObjectURL(file);
+                const image = new Image();
+                image.onload = () => {
+                    try {
+                        const sourceWidth = image.naturalWidth || image.width;
+                        const sourceHeight = image.naturalHeight || image.height;
+                        if (!sourceWidth || !sourceHeight) {
+                            throw new Error("Ảnh không có kích thước hợp lệ.");
+                        }
+                        const targetMaxWidth = 1280;
+                        const scale = Math.min(1, targetMaxWidth / sourceWidth);
+                        const canvas = document.createElement("canvas");
+                        canvas.width = Math.round(sourceWidth * scale);
+                        canvas.height = Math.round(sourceHeight * scale);
+                        canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
+                        resolve(canvas.toDataURL("image/jpeg", 0.86));
+                    } catch (error) {
+                        reject(error);
+                    } finally {
+                        URL.revokeObjectURL(imageUrl);
+                    }
+                };
+                image.onerror = () => {
+                    URL.revokeObjectURL(imageUrl);
+                    reject(new Error("Không đọc được ảnh vừa chụp."));
+                };
+                image.src = imageUrl;
+            });
+
             const openOrderCamera = async () => {
+                if (isMobileCaptureDevice() && cameraFileInput) {
+                    hideKeyboard();
+                    stopOrderCamera();
+                    cameraFileInput.value = "";
+                    cameraFileInput.click();
+                    return;
+                }
                 if (!cameraModal || !cameraVideo || !cameraStatus || !cameraCaptureButton) return;
                 const attemptId = ++cameraOpenAttemptId;
                 hideKeyboard();
@@ -2539,14 +2604,116 @@ def page_template(
                 canvas.height = Math.round(sourceHeight * scale);
                 canvas.getContext("2d").drawImage(cameraVideo, 0, 0, canvas.width, canvas.height);
                 const photoData = canvas.toDataURL("image/jpeg", jpegQuality);
-                cameraPhotoData.value = photoData;
-                cameraPreviewImage.src = photoData;
-                cameraPreview.classList.remove("is-hidden");
-                if (cameraOpenButton) cameraOpenButton.textContent = "📷 Chụp lại ảnh đơn hàng";
+                storeOrderPhotoData(photoData);
                 closeOrderCamera();
             };
 
             cameraOpenButton?.addEventListener("click", openOrderCamera);
+            cameraFileInput?.addEventListener("change", async () => {
+                const file = cameraFileInput.files?.[0];
+                if (!file) return;
+                try {
+                    const photoData = await convertImageFileToJpegDataUrl(file);
+                    storeOrderPhotoData(photoData);
+                } catch (error) {
+                    window.alert(error?.message || "Không xử lý được ảnh vừa chụp.");
+                } finally {
+                    cameraFileInput.value = "";
+                }
+            });
+
+            const setQrScannerStatus = (message) => {
+                if (qrScannerStatus) qrScannerStatus.textContent = message;
+            };
+
+            const stopQrScanner = () => {
+                if (qrScannerFrame) {
+                    window.cancelAnimationFrame(qrScannerFrame);
+                    qrScannerFrame = 0;
+                }
+                if (qrScannerStream) {
+                    qrScannerStream.getTracks().forEach((track) => track.stop());
+                    qrScannerStream = null;
+                }
+                if (qrScannerVideo) qrScannerVideo.srcObject = null;
+            };
+
+            const closeQrScanner = () => {
+                stopQrScanner();
+                qrScannerModal?.classList.remove("visible");
+                qrScannerModal?.setAttribute("aria-hidden", "true");
+                qrScannerTarget = null;
+            };
+
+            const storeQrScannerValue = (rawValue) => {
+                const value = String(rawValue || "").trim();
+                if (!value || !qrScannerTarget) return false;
+                qrScannerTarget.value = value;
+                qrScannerTarget.dispatchEvent(new Event("input", { bubbles: true }));
+                qrScannerTarget.dispatchEvent(new Event("change", { bubbles: true }));
+                qrScannerTarget.classList.add("scanner-filled");
+                window.setTimeout(() => qrScannerTarget?.classList.remove("scanner-filled"), 900);
+                closeQrScanner();
+                return true;
+            };
+
+            const scanQrFrame = async () => {
+                if (!qrScannerDetector || !qrScannerVideo || !qrScannerStream) return;
+                try {
+                    if (qrScannerVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+                        const codes = await qrScannerDetector.detect(qrScannerVideo);
+                        const qrCode = codes.find((code) => code.rawValue);
+                        if (qrCode && storeQrScannerValue(qrCode.rawValue)) return;
+                    }
+                } catch (error) {
+                    setQrScannerStatus("Chưa đọc được mã, giữ camera gần QR và thử lại.");
+                }
+                qrScannerFrame = window.requestAnimationFrame(scanQrFrame);
+            };
+
+            const openQrScanner = async (targetSelector) => {
+                const target = targetSelector ? document.querySelector(targetSelector) : scannerTarget;
+                if (!target || !qrScannerModal || !qrScannerVideo) return;
+                hideKeyboard();
+                qrScannerTarget = target;
+
+                if (!("BarcodeDetector" in window)) {
+                    window.alert("Trình duyệt này chưa hỗ trợ quét QR trực tiếp. Vui lòng mở bằng Chrome/Edge trên Android hoặc nhập mã đơn hàng bằng bàn phím.");
+                    return;
+                }
+
+                try {
+                    stopQrScanner();
+                    if (!qrScannerDetector) {
+                        qrScannerDetector = new window.BarcodeDetector({ formats: ["qr_code"] });
+                    }
+                    qrScannerModal.classList.add("visible");
+                    qrScannerModal.setAttribute("aria-hidden", "false");
+                    setQrScannerStatus("Đang mở camera sau...");
+                    qrScannerStream = await navigator.mediaDevices.getUserMedia({
+                        video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+                        audio: false,
+                    });
+                    qrScannerVideo.srcObject = qrScannerStream;
+                    await qrScannerVideo.play();
+                    setQrScannerStatus("Đưa mã QR trên đơn hàng vào khung camera.");
+                    scanQrFrame();
+                } catch (error) {
+                    closeQrScanner();
+                    const errorName = error?.name || "";
+                    const message = errorName === "NotAllowedError" || errorName === "SecurityError"
+                        ? "Bạn chưa cấp quyền camera cho trình duyệt."
+                        : "Không mở được camera điện thoại.";
+                    window.alert(`${message} Vui lòng kiểm tra quyền camera hoặc nhập mã đơn hàng bằng bàn phím.`);
+                }
+            };
+
+            qrScannerButtons.forEach((button) => {
+                button.addEventListener("click", () => openQrScanner(button.dataset.qrTarget || ""));
+            });
+            document.querySelectorAll("[data-close-qr-scanner]").forEach((button) => {
+                button.addEventListener("click", closeQrScanner);
+            });
             document.querySelectorAll("[data-close-order-camera]").forEach((button) => {
                 button.addEventListener("click", closeOrderCamera);
             });
@@ -2574,6 +2741,7 @@ def page_template(
                 if (cameraOpenButton) cameraOpenButton.textContent = "📷 Chụp đơn hàng";
             });
             window.addEventListener("beforeunload", stopOrderCamera);
+            window.addEventListener("beforeunload", stopQrScanner);
 
             const showKeyboard = () => {
                 if (!keyboard) return;
@@ -2720,12 +2888,37 @@ def page_template(
                 fields.forEach((item) => item.classList.remove("active-input"));
                 activeField = field;
                 activeField.classList.add("active-input");
+                if (nativeMobileInputActive) {
+                    hideKeyboard();
+                    ensureFieldVisible(activeField);
+                    return;
+                }
                 applyKeyboardMode(activeField);
                 showKeyboard();
                 ensureFieldVisible(activeField);
             };
 
+            const nativeInputModeFor = (field) => {
+                const mode = field?.dataset.keyboardMode || "text";
+                if (mode === "numeric") return "numeric";
+                if (mode === "email") return "email";
+                return "text";
+            };
+
+            if (nativeMobileInputActive) {
+                document.documentElement.classList.add("native-mobile-input");
+                fields.forEach((field) => {
+                    field.readOnly = false;
+                    field.setAttribute("inputmode", nativeInputModeFor(field));
+                });
+                hideKeyboard();
+            }
+
             fields.forEach((field) => {
+                if (nativeMobileInputActive) {
+                    field.addEventListener("focus", () => setActive(field));
+                    return;
+                }
                 field.addEventListener("pointerdown", (event) => {
                     event.preventDefault();
                     event.stopPropagation();
@@ -2743,7 +2936,7 @@ def page_template(
             // Kiosk inputs remain readonly to suppress the system keyboard, so
             // collect that key stream here and place it in the scanner field.
             document.addEventListener("keydown", (event) => {
-                if (!scannerTarget || event.ctrlKey || event.metaKey || event.altKey) return;
+                if (nativeMobileInputActive || !scannerTarget || event.ctrlKey || event.metaKey || event.altKey) return;
 
                 const now = performance.now();
                 if (event.key === "Enter" || event.key === "Tab") {
@@ -3763,6 +3956,14 @@ def page_template(
                 font-weight: 700;
             }}
 
+            .order-camera-file {{
+                position: absolute;
+                width: 1px;
+                height: 1px;
+                opacity: 0;
+                pointer-events: none;
+            }}
+
             .order-camera-open {{
                 width: 100%;
                 min-height: 68px;
@@ -3773,6 +3974,41 @@ def page_template(
                 font-size: 1.15rem;
                 font-weight: 800;
                 cursor: pointer;
+            }}
+
+            .qr-scan-button {{
+                width: 100%;
+                min-height: 58px;
+                margin-top: 10px;
+                border: 0;
+                border-radius: 16px;
+                background: #12345d;
+                color: #ffffff;
+                font-size: 1rem;
+                font-weight: 850;
+                cursor: pointer;
+            }}
+
+            .qr-scanner-view {{
+                min-height: min(460px, 62vh);
+            }}
+
+            .qr-scanner-view video {{
+                height: min(62vh, 560px);
+                object-fit: cover;
+            }}
+
+            .qr-scan-frame {{
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                width: min(68vw, 360px);
+                aspect-ratio: 1;
+                border: 4px solid rgba(255, 255, 255, 0.92);
+                border-radius: 24px;
+                box-shadow: 0 0 0 999px rgba(3, 24, 57, 0.24);
+                transform: translate(-50%, -50%);
+                pointer-events: none;
             }}
 
             .order-camera-preview {{
@@ -3957,6 +4193,10 @@ def page_template(
                 padding-top: 12px;
                 background: #ffffff;
                 z-index: 1;
+            }}
+
+            .order-camera-actions.single {{
+                grid-template-columns: 1fr;
             }}
 
             label {{
@@ -5120,8 +5360,19 @@ def flow_page(
     result_html: str = "",
     enable_order_camera: bool = False,
 ) -> str:
-    form_fields = "".join(
-        f"""
+    def render_form_field(field: tuple[str, str, str, str, str]) -> str:
+        field_id, field_name, label, placeholder, keyboard_mode = field
+        qr_scan_button = f"""
+            <button
+                class="qr-scan-button"
+                type="button"
+                data-open-qr-scanner
+                data-qr-target="#{field_id}"
+            >
+                Quét QR mã đơn hàng
+            </button>
+        """ if field_name == "order_code" else ""
+        return f"""
         <div>
             <label for="{field_id}">{escape(label)}</label>
             <input
@@ -5136,14 +5387,34 @@ def flow_page(
                 {'data-scanner-input="true"' if field_name in {'order_code', 'pickup_code'} else ''}
                 required
             >
+            {qr_scan_button}
         </div>
         """
-        for field_id, field_name, label, placeholder, keyboard_mode in fields
-    )
+
+    form_fields = "".join(render_form_field(field) for field in fields)
+    qr_scanner_html = """
+        <div class="order-camera-backdrop qr-scanner-backdrop" data-qr-scanner-modal aria-hidden="true">
+            <section class="order-camera-dialog qr-scanner-dialog" role="dialog" aria-modal="true" aria-label="Quét QR mã đơn hàng">
+                <div class="order-camera-head">
+                    <h3>Quét QR mã đơn hàng</h3>
+                    <button type="button" data-close-qr-scanner aria-label="Đóng quét QR">×</button>
+                </div>
+                <div class="order-camera-view qr-scanner-view">
+                    <video data-qr-scanner-video autoplay playsinline muted></video>
+                    <div class="qr-scan-frame" aria-hidden="true"></div>
+                </div>
+                <p data-qr-scanner-status>Đưa mã QR trên đơn hàng vào khung camera.</p>
+                <div class="order-camera-actions single">
+                    <button class="submit-button secondary" type="button" data-close-qr-scanner>Hủy quét</button>
+                </div>
+            </section>
+        </div>
+    """ if any(field_name == "order_code" for _, field_name, _, _, _ in fields) else ""
     camera_html = """
         <section class="order-camera-field">
             <span class="order-camera-label">Ảnh đơn hàng</span>
             <input type="hidden" name="order_photo_data" data-order-photo-data>
+            <input class="order-camera-file" type="file" accept="image/*" capture="environment" data-order-camera-file>
             <button class="order-camera-open" type="button" data-open-order-camera>
                 📷 Chụp đơn hàng
             </button>
@@ -5197,6 +5468,7 @@ def flow_page(
                 {result_html}
             </section>
         </section>
+        {qr_scanner_html}
         """,
         show_keyboard=True,
         enable_admin_command_polling=True,

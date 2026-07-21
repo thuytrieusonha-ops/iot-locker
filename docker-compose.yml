@@ -7,6 +7,11 @@ x-smartlocker-db-env: &smartlocker-db-env
   SMARTLOCKER_DATABASE_USER: ${MYSQL_USER:-smartlocker_user}
   SMARTLOCKER_DATABASE_PASSWORD: ${MYSQL_PASSWORD:-Locker123!}
 
+x-smartlocker-dns: &smartlocker-dns
+  dns:
+    - 1.1.1.1
+    - 8.8.8.8
+
 services:
   mqtt:
     image: eclipse-mosquitto:2
@@ -41,6 +46,7 @@ services:
       start_period: 20s
 
   app:
+    <<: *smartlocker-dns
     build:
       context: .
       dockerfile: Dockerfile
@@ -72,6 +78,7 @@ services:
       start_period: 20s
 
   gateway:
+    <<: *smartlocker-dns
     build:
       context: .
       dockerfile: Dockerfile
@@ -92,6 +99,7 @@ services:
         condition: service_started
 
   monitor:
+    <<: *smartlocker-dns
     build:
       context: .
       dockerfile: Dockerfile
@@ -121,6 +129,7 @@ services:
       start_period: 20s
 
   cloudflared:
+    <<: *smartlocker-dns
     image: cloudflare/cloudflared:latest
     container_name: smartlocker-cloudflared
     restart: unless-stopped

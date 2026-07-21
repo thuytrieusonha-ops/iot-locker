@@ -2163,13 +2163,15 @@ def page_template(
             const qrScannerVideo = document.querySelector("[data-qr-scanner-video]");
             const qrScannerStatus = document.querySelector("[data-qr-scanner-status]");
             const qrScannerButtons = Array.from(document.querySelectorAll("[data-open-qr-scanner]"));
+            const scannerTargets = Array.from(document.querySelectorAll("[data-scanner-input='true']"));
             let activeField = null;
             let redirectTimer = null;
             let keyboardUppercase = false;
             let scannerBuffer = "";
             let scannerLastKeyAt = 0;
-            const scannerTarget = document.querySelector("[data-scanner-input='true']");
+            let scannerCommitTimer = 0;
             const scannerMaxKeyGapMs = 120;
+            const scannerIdleCommitMs = 180;
             const pointerLooksMobile = window.matchMedia?.("(pointer: coarse)")?.matches;
             const agentLooksMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "");
             const nativeMobileInputActive = Boolean(pointerLooksMobile && agentLooksMobile);
@@ -2672,6 +2674,7 @@ def page_template(
             };
 
             const openQrScanner = async (targetSelector) => {
+                const scannerTarget = scannerTargets[0] || null;
                 const target = targetSelector ? document.querySelector(targetSelector) : scannerTarget;
                 if (!target || !qrScannerModal || !qrScannerVideo) return;
                 hideKeyboard();
@@ -2888,6 +2891,7 @@ def page_template(
                 fields.forEach((item) => item.classList.remove("active-input"));
                 activeField = field;
                 activeField.classList.add("active-input");
+                updateScannerReceiverState();
                 if (nativeMobileInputActive) {
                     hideKeyboard();
                     ensureFieldVisible(activeField);
@@ -2903,6 +2907,64 @@ def page_template(
                 if (mode === "numeric") return "numeric";
                 if (mode === "email") return "email";
                 return "text";
+            };
+
+            const scannerLabelFor = (field) => field?.dataset.scannerLabel || fieldLabel(field);
+
+            const scannerTargetForKeyStream = () => {
+                if (activeField?.matches?.("[data-scanner-input='true']")) {
+                    return activeField;
+                }
+                return scannerTargets[0] || null;
+            };
+
+            const updateScannerReceiverState = (filledField = null) => {
+                document.querySelectorAll("[data-scanner-receiver]").forEach((receiver) => {
+                    const targetSelector = receiver.dataset.scannerTarget || "";
+                    const target = targetSelector ? document.querySelector(targetSelector) : null;
+                    const isActive = Boolean(target && target === scannerTargetForKeyStream());
+                    const wasFilled = Boolean(target && target === filledField);
+                    receiver.classList.toggle("active", isActive && !wasFilled);
+                    receiver.classList.toggle("filled", wasFilled);
+                    const status = receiver.querySelector("[data-scanner-status]");
+                    if (!status || !target) return;
+                    if (wasFilled) {
+                        status.textContent = `Đã nhận ${scannerLabelFor(target)} từ máy quét.`;
+                    } else if (isActive) {
+                        status.textContent = `Đang chờ quét ${scannerLabelFor(target)}.`;
+                    } else {
+                        status.textContent = `Chạm vào ô ${scannerLabelFor(target)} để nhận mã từ máy quét.`;
+                    }
+                });
+            };
+
+            const clearScannerCommitTimer = () => {
+                if (!scannerCommitTimer) return;
+                window.clearTimeout(scannerCommitTimer);
+                scannerCommitTimer = 0;
+            };
+
+            const commitScannerBuffer = (scannerTarget) => {
+                clearScannerCommitTimer();
+                const value = scannerBuffer.trim();
+                scannerBuffer = "";
+                scannerLastKeyAt = 0;
+                if (!scannerTarget || value.length < 2) return;
+
+                scannerTarget.value = value;
+                scannerTarget.dispatchEvent(new Event("input", { bubbles: true }));
+                scannerTarget.dispatchEvent(new Event("change", { bubbles: true }));
+                scannerTarget.classList.add("scanner-filled");
+                window.setTimeout(() => scannerTarget.classList.remove("scanner-filled"), 900);
+                updateScannerReceiverState(scannerTarget);
+                window.setTimeout(() => updateScannerReceiverState(), 1200);
+            };
+
+            const scheduleScannerCommit = (scannerTarget) => {
+                clearScannerCommitTimer();
+                scannerCommitTimer = window.setTimeout(() => {
+                    commitScannerBuffer(scannerTarget);
+                }, scannerIdleCommitMs);
             };
 
             if (nativeMobileInputActive) {
@@ -2936,29 +2998,24 @@ def page_template(
             // Kiosk inputs remain readonly to suppress the system keyboard, so
             // collect that key stream here and place it in the scanner field.
             document.addEventListener("keydown", (event) => {
+                const scannerTarget = scannerTargetForKeyStream();
                 if (nativeMobileInputActive || !scannerTarget || event.ctrlKey || event.metaKey || event.altKey) return;
 
                 const now = performance.now();
                 if (event.key === "Enter" || event.key === "Tab") {
-                    if (scannerBuffer.length >= 2) {
-                        event.preventDefault();
-                        scannerTarget.value = scannerBuffer.trim();
-                        scannerTarget.dispatchEvent(new Event("input", { bubbles: true }));
-                        scannerTarget.dispatchEvent(new Event("change", { bubbles: true }));
-                        scannerTarget.classList.add("scanner-filled");
-                        window.setTimeout(() => scannerTarget.classList.remove("scanner-filled"), 900);
-                    }
-                    scannerBuffer = "";
-                    scannerLastKeyAt = 0;
+                    event.preventDefault();
+                    commitScannerBuffer(scannerTarget);
                     return;
                 }
 
                 if (event.key.length === 1) {
+                    event.preventDefault();
                     if (scannerLastKeyAt && now - scannerLastKeyAt > scannerMaxKeyGapMs) {
                         scannerBuffer = "";
                     }
                     scannerBuffer += event.key;
                     scannerLastKeyAt = now;
+                    scheduleScannerCommit(scannerTarget);
                 }
             });
 
@@ -3050,6 +3107,7 @@ def page_template(
             updateKeyboardSpace();
             updateScrollControl();
             queueScrollControlUpdate();
+            updateScannerReceiverState();
 
 """ + ("""
             const refreshAdminCommand = async () => {
@@ -3987,6 +4045,47 @@ def page_template(
                 font-size: 1rem;
                 font-weight: 850;
                 cursor: pointer;
+            }}
+
+            .scanner-receiver {{
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                min-height: 52px;
+                margin-top: 10px;
+                padding: 12px 14px;
+                border: 2px solid rgba(11, 79, 174, 0.18);
+                border-radius: 16px;
+                background: #f4f9ff;
+                color: #3d6fa8;
+                font-size: 0.98rem;
+                font-weight: 750;
+                line-height: 1.35;
+            }}
+
+            .scanner-receiver.active {{
+                border-color: rgba(11, 79, 174, 0.46);
+                background: #e8f2ff;
+                color: #0b4fae;
+            }}
+
+            .scanner-receiver.filled {{
+                border-color: rgba(21, 148, 71, 0.42);
+                background: #effcf3;
+                color: #126b36;
+            }}
+
+            .scanner-receiver-icon {{
+                flex: 0 0 auto;
+                display: inline-grid;
+                place-items: center;
+                width: 34px;
+                height: 34px;
+                border-radius: 10px;
+                background: #ffffff;
+                color: currentColor;
+                font-size: 1.3rem;
+                line-height: 1;
             }}
 
             .qr-scanner-view {{
@@ -5362,6 +5461,17 @@ def flow_page(
 ) -> str:
     def render_form_field(field: tuple[str, str, str, str, str]) -> str:
         field_id, field_name, label, placeholder, keyboard_mode = field
+        accepts_scanner_input = field_name in {"order_code", "pickup_code"}
+        scanner_note = f"""
+            <div
+                class="scanner-receiver"
+                data-scanner-receiver
+                data-scanner-target="#{field_id}"
+            >
+                <span class="scanner-receiver-icon" aria-hidden="true">▦</span>
+                <span data-scanner-status>Chạm vào ô {escape(label)} để nhận mã từ máy quét.</span>
+            </div>
+        """ if accepts_scanner_input else ""
         qr_scan_button = f"""
             <button
                 class="qr-scan-button"
@@ -5384,9 +5494,11 @@ def flow_page(
                 readonly
                 data-touch-input="true"
                 data-keyboard-mode="{keyboard_mode}"
-                {'data-scanner-input="true"' if field_name in {'order_code', 'pickup_code'} else ''}
+                {'data-scanner-input="true"' if accepts_scanner_input else ''}
+                {'data-scanner-label="' + escape(label) + '"' if accepts_scanner_input else ''}
                 required
             >
+            {scanner_note}
             {qr_scan_button}
         </div>
         """

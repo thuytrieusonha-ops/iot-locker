@@ -76,6 +76,37 @@ class FormValidationUiTests(unittest.TestCase):
         self.assertIn("new window.BarcodeDetector", page)
         self.assertIn("qrScannerTarget.value = value", page)
 
+    def test_order_code_and_pickup_code_show_hardware_scanner_receiver(self) -> None:
+        order_page = flow_page(
+            title="Giao hàng",
+            subtitle="Test",
+            action="/giao-do",
+            fields=[
+                ("phone", "phone", "Số điện thoại", "Nhập số điện thoại", "numeric"),
+                ("order_code", "order_code", "Mã đơn hàng", "Quét hoặc nhập mã đơn hàng", "full"),
+            ],
+            submit_label="Lưu hàng",
+        )
+        pickup_page = flow_page(
+            title="Nhận hàng",
+            subtitle="Test",
+            action="/nhan-do",
+            fields=[
+                ("phone", "phone", "Số điện thoại", "Nhập số điện thoại", "numeric"),
+                ("pickup_code", "pickup_code", "Mã mở tủ", "Quét hoặc nhập mã mở tủ", "numeric"),
+            ],
+            submit_label="Mở tủ",
+        )
+
+        self.assertIn('data-scanner-target="#order_code"', order_page)
+        self.assertIn('data-scanner-label="Mã đơn hàng"', order_page)
+        self.assertIn('data-scanner-target="#pickup_code"', pickup_page)
+        self.assertIn('data-scanner-label="Mã mở tủ"', pickup_page)
+        self.assertIn("scannerTargetForKeyStream", pickup_page)
+        self.assertIn("commitScannerBuffer(scannerTarget)", pickup_page)
+        self.assertIn("scheduleScannerCommit(scannerTarget)", pickup_page)
+        self.assertIn("scannerIdleCommitMs", pickup_page)
+
 
 if __name__ == "__main__":
     unittest.main()
